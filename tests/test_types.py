@@ -247,6 +247,21 @@ class TestDeepResearchError:
         assert error.message == "Research timed out after 20 minutes"
         assert error.details == {}
 
+    def test_construction_without_message_uses_fallback(self):
+        """Missing message should not raise and should use deterministic fallback."""
+        error = DeepResearchError(code="INTERNAL_ERROR")
+        assert error.code == "INTERNAL_ERROR"
+        assert error.message == "No error message provided."
+        assert str(error) == "INTERNAL_ERROR: No error message provided."
+
+    def test_construction_uses_message_from_details_when_missing(self):
+        """details['message'] should be used when explicit message is missing."""
+        error = DeepResearchError(
+            code="API_ERROR",
+            details={"message": "Provider returned malformed payload"},
+        )
+        assert error.message == "Provider returned malformed payload"
+
     def test_construction_with_details(self):
         """DeepResearchError should accept details."""
         error = DeepResearchError(

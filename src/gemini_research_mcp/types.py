@@ -74,16 +74,30 @@ class DeepResearchError(Exception):
     def __init__(
         self,
         code: str,
-        message: str,
+        message: str | None = None,
         details: dict[str, Any] | None = None,
         category: ErrorCategory | None = None,
     ):
+        """Initialize a structured Deep Research error.
+
+        `message` is optional for compatibility with runtime/task wrappers that may
+        only provide an error code. We normalize to a deterministic fallback message
+        so error construction itself never masks the original failure path.
+        """
+        resolved_message = (message or "").strip()
+        if not resolved_message and details:
+            details_message = details.get("message")
+            if isinstance(details_message, str) and details_message.strip():
+                resolved_message = details_message.strip()
+        if not resolved_message:
+            resolved_message = "No error message provided."
+
         self.code = code
-        self.message = message
+        self.message = resolved_message
         self.details = details or {}
         # Auto-categorize if not provided
-        self.category = category or _categorize_error_message(message)
-        super().__init__(f"{code}: {message}")
+        self.category = category or _categorize_error_message(resolved_message)
+        super().__init__(f"{code}: {resolved_message}")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
