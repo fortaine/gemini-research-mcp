@@ -189,3 +189,90 @@ async def test_deep_research_stream_passes_mcp_servers_to_interactions(
             "allowed_tools": [{"tools": ["get_fixture"]}],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_deep_research_stream_maps_genai_v2_step_delta_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_stream():
+        yield SimpleNamespace(
+            event_type="interaction.created",
+            interaction=SimpleNamespace(id="interaction-v2"),
+            event_id="event-start",
+        )
+        yield SimpleNamespace(
+            event_type="step.delta",
+            delta=SimpleNamespace(
+                type="thought_summary",
+                content=SimpleNamespace(text="Plan search strategy"),
+            ),
+            event_id="event-thought",
+        )
+        yield SimpleNamespace(
+            event_type="step.delta",
+            delta=SimpleNamespace(type="text", text="Final report paragraph."),
+            event_id="event-text",
+        )
+        yield SimpleNamespace(
+            event_type="interaction.completed",
+            interaction=SimpleNamespace(id="interaction-v2", status="completed"),
+            event_id="event-complete",
+        )
+
+    class FakeInteractions:
+        async def create(self, **kwargs: Any):
+            del kwargs
+            return fake_stream()
+
+    fake_client = SimpleNamespace(aio=SimpleNamespace(interactions=FakeInteractions()))
+    monkeypatch.setattr(deep, "_get_healthy_client", lambda: fake_client)
+
+    events = [
+        event
+        async for event in deep_research_stream(
+            "Use the GenAI 2.x stream shape.",
+        )
+    ]
+
+    assert [event.event_type for event in events] == ["start", "thought", "text", "complete"]
+    assert events[0].interaction_id == "interaction-v2"
+    assert events[1].content == "Plan search strategy"
+    assert events[2].content == "Final report paragraph."
+
+
+@pytest.mark.asyncio
+async def test_deep_research_stream_maps_genai_v2_status_failure_to_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_stream():
+        yield SimpleNamespace(
+            event_type="interaction.created",
+            interaction=SimpleNamespace(id="interaction-failed"),
+            event_id="event-start",
+        )
+        yield SimpleNamespace(
+            event_type="interaction.status_update",
+            interaction_id="interaction-failed",
+            status="failed",
+            event_id="event-failed",
+        )
+
+    class FakeInteractions:
+        async def create(self, **kwargs: Any):
+            del kwargs
+            return fake_stream()
+
+    fake_client = SimpleNamespace(aio=SimpleNamespace(interactions=FakeInteractions()))
+    monkeypatch.setattr(deep, "_get_healthy_client", lambda: fake_client)
+
+    events = [
+        event
+        async for event in deep_research_stream(
+            "Map provider status failure.",
+        )
+    ]
+
+    assert [event.event_type for event in events] == ["start", "error"]
+    assert events[1].interaction_id == "interaction-failed"
+    assert "failed" in (events[1].content or "")

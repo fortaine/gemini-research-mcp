@@ -109,6 +109,10 @@ strict = true
 python_version = "3.12"
 
 [[tool.mypy.overrides]]
+module = "fastmcp.server.transforms.search"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = ["protego"]
 ignore_missing_imports = true
 

@@ -376,6 +376,57 @@ def _extract_text_from_interaction(interaction: Any) -> str | None:
     return None
 
 
+def _get_stream_event_type(event: Any) -> str:
+    """Return stream event type across google-genai interaction event shapes."""
+    event_type = getattr(event, "event_type", None)
+    if isinstance(event_type, str) and event_type:
+        return event_type
+
+    fallback_type = getattr(event, "type", None)
+    if isinstance(fallback_type, str) and fallback_type:
+        return fallback_type
+
+    return "unknown"
+
+
+def _extract_interaction_id(event: Any) -> str | None:
+    """Extract interaction id across old and new interaction event shapes."""
+    interaction = getattr(event, "interaction", None)
+    if interaction is not None:
+        if isinstance(interaction, dict):
+            interaction_id = interaction.get("id")
+        else:
+            interaction_id = getattr(interaction, "id", None)
+        if interaction_id:
+            return str(interaction_id)
+
+    event_interaction_id = getattr(event, "interaction_id", None)
+    if event_interaction_id:
+        return str(event_interaction_id)
+
+    return None
+
+
+def _extract_interaction_status(event: Any) -> str | None:
+    """Extract interaction status across old and new interaction event shapes."""
+    status = getattr(event, "status", None)
+    if isinstance(status, str) and status:
+        return status
+
+    interaction = getattr(event, "interaction", None)
+    if interaction is None:
+        return None
+
+    if isinstance(interaction, dict):
+        interaction_status = interaction.get("status")
+    else:
+        interaction_status = getattr(interaction, "status", None)
+
+    if isinstance(interaction_status, str) and interaction_status:
+        return interaction_status
+    return None
+
+
 async def deep_research_stream(
     query: str,
     *,
@@ -464,12 +515,12 @@ async def deep_research_stream(
             received_any_event = True
             elapsed = time.time() - stream_start_time
 
-            chunk_type = getattr(chunk, "event_type", "unknown")
+            chunk_type = _get_stream_event_type(chunk)
             logger.debug("[%.1fs] 📦 CHUNK #%d: type=%s", elapsed, chunk_count, chunk_type)
 
-            if chunk.event_type == "interaction.start":
-                interaction_id = chunk.interaction.id
-                logger.info("[%.1fs] 🚀 interaction.start: id=%s", elapsed, interaction_id)
+            if chunk_type in ("interaction.start", "interaction.created"):
+                interaction_id = _extract_interaction_id(chunk)
+                logger.info("[%.1fs] 🚀 %s: id=%s", elapsed, chunk_type, interaction_id)
                 _record_client_success()  # Record successful API interaction
                 yield DeepResearchProgress(
                     event_type="start",
@@ -481,11 +532,27 @@ async def deep_research_stream(
             if hasattr(chunk, "event_id") and chunk.event_id:
                 last_event_id = chunk.event_id
 
-            if chunk.event_type == "content.delta":
-                delta = chunk.delta
-                if delta.type == "thought_summary":
-                    content = delta.content
-                    thought_text = content.text if hasattr(content, "text") else str(content)
+            if chunk_type in ("content.delta", "step.delta"):
+                delta = getattr(chunk, "delta", None)
+                if delta is None:
+                    continue
+                delta_type = (
+                    delta.get("type")
+                    if isinstance(delta, dict)
+                    else getattr(delta, "type", None)
+                )
+                if delta_type == "thought_summary":
+                    content = (
+                        delta.get("content")
+                        if isinstance(delta, dict)
+                        else getattr(delta, "content", None)
+                    )
+                    if isinstance(content, dict):
+                        thought_text = content.get("text") or str(content)
+                    elif content is None:
+                        thought_text = ""
+                    else:
+                        thought_text = content.text if hasattr(content, "text") else str(content)
                     logger.debug("[%.1fs] 🧠 thought_summary", elapsed)
                     yield DeepResearchProgress(
                         event_type="thought",
@@ -493,20 +560,33 @@ async def deep_research_stream(
                         interaction_id=interaction_id,
                         event_id=last_event_id,
                     )
-                elif delta.type == "text":
-                    logger.debug("[%.1fs] 📝 text delta: %d chars", elapsed, len(delta.text))
+                elif delta_type == "text":
+                    if isinstance(delta, dict):
+                        delta_text = delta.get("text")
+                        content = delta.get("content")
+                    else:
+                        delta_text = getattr(delta, "text", None)
+                        content = getattr(delta, "content", None)
+                    if delta_text is None and content is not None:
+                        if isinstance(content, dict):
+                            delta_text = content.get("text")
+                        else:
+                            delta_text = getattr(content, "text", None)
+                    logger.debug("[%.1fs] 📝 text delta: %d chars", elapsed, len(delta_text or ""))
                     yield DeepResearchProgress(
                         event_type="text",
-                        content=delta.text,
+                        content=delta_text,
                         interaction_id=interaction_id,
                         event_id=last_event_id,
                     )
 
-            elif chunk.event_type == "interaction.complete":
-                interaction = getattr(chunk, "interaction", None)
-                interaction_status = getattr(interaction, "status", "unknown")
+            elif chunk_type in ("interaction.complete", "interaction.completed"):
+                completed_interaction_id = _extract_interaction_id(chunk)
+                if completed_interaction_id:
+                    interaction_id = completed_interaction_id
+                interaction_status = _extract_interaction_status(chunk) or "unknown"
                 logger.info(
-                    "[%.1fs] ✅ interaction.complete (status=%s)", elapsed, interaction_status
+                    "[%.1fs] ✅ %s (status=%s)", elapsed, chunk_type, interaction_status
                 )
 
                 if interaction_status == "completed":
@@ -519,8 +599,9 @@ async def deep_research_stream(
                 elif interaction_status in ("cancelled", "canceled"):
                     is_complete = True
                     logger.warning(
-                        "[%.1fs] 🚫 interaction.complete: cancelled",
+                        "[%.1fs] 🚫 %s: cancelled",
                         elapsed,
+                        chunk_type,
                     )
                     yield DeepResearchProgress(
                         event_type="error",
@@ -531,8 +612,9 @@ async def deep_research_stream(
                 elif interaction_status == "failed":
                     is_complete = True
                     logger.error(
-                        "[%.1fs] ❌ interaction.complete: failed",
+                        "[%.1fs] ❌ %s: failed",
                         elapsed,
+                        chunk_type,
                     )
                     yield DeepResearchProgress(
                         event_type="error",
@@ -542,12 +624,59 @@ async def deep_research_stream(
                     )
                 else:
                     logger.warning(
-                        "[%.1fs] ⚠️ interaction.complete but status='%s'",
+                        "[%.1fs] ⚠️ %s but status='%s'",
                         elapsed,
+                        chunk_type,
                         interaction_status,
                     )
 
-            elif chunk.event_type == "error":
+            elif chunk_type in (
+                "interaction.status_update",
+                "interaction.in_progress",
+                "interaction.requires_action",
+                "interaction.failed",
+            ):
+                status_interaction_id = _extract_interaction_id(chunk)
+                if status_interaction_id and interaction_id is None:
+                    interaction_id = status_interaction_id
+
+                status_update = _extract_interaction_status(chunk)
+                if status_update is None and chunk_type.startswith("interaction."):
+                    status_update = chunk_type.split(".", maxsplit=1)[1]
+
+                logger.info(
+                    "[%.1fs] ℹ️ %s (status=%s, id=%s)",
+                    elapsed,
+                    chunk_type,
+                    status_update,
+                    interaction_id,
+                )
+
+                if status_update in ("cancelled", "canceled"):
+                    is_complete = True
+                    yield DeepResearchProgress(
+                        event_type="error",
+                        content="Research cancelled by provider.",
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                    )
+                elif status_update in ("failed", "incomplete", "budget_exceeded"):
+                    is_complete = True
+                    yield DeepResearchProgress(
+                        event_type="error",
+                        content=f"Research failed on provider side (status={status_update}).",
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                    )
+                elif status_update == "completed":
+                    is_complete = True
+                    yield DeepResearchProgress(
+                        event_type="complete",
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                    )
+
+            elif chunk_type == "error":
                 is_complete = True
                 error_msg = getattr(chunk, "error", "Unknown error")
                 logger.error("[%.1fs] ❌ error: %s", elapsed, error_msg)
@@ -595,10 +724,10 @@ async def deep_research_stream(
             async for progress in process_stream(stream):
                 yield progress
 
-            # If we got here without receiving interaction.start, log it
+            # If we got here without receiving an interaction start event, log it
             if interaction_id is None and received_any_event:
                 logger.warning(
-                    "⏱️ [%.1fs] ⚠️ Stream ended but never received interaction.start event",
+                    "⏱️ [%.1fs] ⚠️ Stream ended but never received interaction start event",
                     time.time() - stream_start_time
                 )
             break
