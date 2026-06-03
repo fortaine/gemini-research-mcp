@@ -113,7 +113,7 @@ def test_extract_text_from_interaction_skips_reasoning_content() -> None:
     assert _extract_text_from_interaction(interaction) == "Visible final answer."
 
 
-def test_extract_text_from_interaction_legacy_outputs_fallback() -> None:
+def test_extract_text_from_interaction_ignores_legacy_outputs_only_payload() -> None:
     interaction = SimpleNamespace(
         outputs=[
             SimpleNamespace(text="Legacy output one."),
@@ -121,10 +121,7 @@ def test_extract_text_from_interaction_legacy_outputs_fallback() -> None:
         ]
     )
 
-    assert (
-        _extract_text_from_interaction(interaction)
-        == "Legacy output one.\n\nLegacy output two."
-    )
+    assert _extract_text_from_interaction(interaction) is None
 
 
 def test_extract_usage_supports_interactions_usage_fields() -> None:

@@ -425,19 +425,6 @@ def _extract_text_from_interaction(interaction: Any) -> str | None:
     if text_parts:
         return "\n\n".join(text_parts)
 
-    outputs = _as_sequence(_get_interaction_field(interaction, "outputs"))
-    legacy_text_parts: list[str] = []
-    for output in outputs:
-        text = _get_interaction_field(output, "text")
-        if isinstance(text, str) and text.strip():
-            legacy_text_parts.append(text)
-            continue
-        content = _get_interaction_field(output, "content")
-        if isinstance(content, str) and content.strip():
-            legacy_text_parts.append(content)
-    if legacy_text_parts:
-        return "\n\n".join(legacy_text_parts)
-
     return None
 
 
@@ -1104,7 +1091,7 @@ async def get_research_status(interaction_id: str) -> DeepResearchResult:
         interaction_id: The interaction ID from a research task
 
     Returns:
-        DeepResearchResult with current status and any available outputs
+        DeepResearchResult with current status and any available report text
     """
     client = _get_healthy_client()  # Use health-monitored client
     interaction = await client.aio.interactions.get(id=interaction_id)
@@ -1163,12 +1150,6 @@ async def research_followup(
 
         # Extract text from the response
         text = _extract_text_from_interaction(interaction)
-
-        if not text:
-            # Try outputs directly
-            outputs = getattr(interaction, "outputs", [])
-            if outputs:
-                text = str(outputs[-1])
 
         if not text:
             raise DeepResearchError(
