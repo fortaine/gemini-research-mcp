@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from gemini_research_mcp.export import (
+    EMPTY_REPORT_WARNING,
     ExportFormat,
     ExportResult,
     export_session,
@@ -149,6 +150,20 @@ class TestMarkdownExport:
         assert "# Simple query" in content
         assert "## Metadata" in content
         assert "**Query:** Simple query" in content
+        assert "## Report Unavailable" in content
+        assert EMPTY_REPORT_WARNING in content
+
+    def test_markdown_whitespace_report_is_unavailable(
+        self, minimal_session: ResearchSession
+    ) -> None:
+        """Whitespace-only report text should still show diagnostics."""
+        minimal_session.report_text = "\n\n  "
+        result = export_to_markdown(minimal_session)
+        content = result.content.decode("utf-8")
+
+        assert "## Report Unavailable" in content
+        assert "## Research Report" not in content
+        assert EMPTY_REPORT_WARNING in content
 
     def test_markdown_size_human(self, sample_session: ResearchSession) -> None:
         """Test human-readable size formatting."""
@@ -204,6 +219,18 @@ class TestJsonExport:
         assert data["query"] == minimal_session.query
         assert data["title"] is None
         assert data["summary"] is None
+        assert data["has_report_text"] is False
+        assert data["export_warning"] == EMPTY_REPORT_WARNING
+
+    def test_json_export_with_report_has_no_warning(
+        self, sample_session: ResearchSession
+    ) -> None:
+        """Completed report exports should not include an empty-report warning."""
+        result = export_to_json(sample_session)
+        data = json.loads(result.content.decode("utf-8"))
+
+        assert data["has_report_text"] is True
+        assert data["export_warning"] is None
 
 
 # =============================================================================

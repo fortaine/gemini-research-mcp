@@ -38,6 +38,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(LOGGER_NAME)
 
 
+EMPTY_REPORT_WARNING = (
+    "This session has no stored report text. The Deep Research interaction may have "
+    "completed without extractable output, or it may need to be recovered with "
+    "resume_research after upgrading the output extractor."
+)
+
+
 class ExportFormat(str, Enum):
     """Supported export formats."""
 
@@ -110,10 +117,16 @@ def _format_markdown_export(session: ResearchSession) -> str:
         lines.append("")
 
     # Full report
-    if session.report_text:
+    report_text = (session.report_text or "").strip()
+    if report_text:
         lines.append("## Research Report")
         lines.append("")
-        lines.append(session.report_text)
+        lines.append(report_text)
+        lines.append("")
+    else:
+        lines.append("## Report Unavailable")
+        lines.append("")
+        lines.append(EMPTY_REPORT_WARNING)
         lines.append("")
 
     # Footer
@@ -146,12 +159,15 @@ def export_to_markdown(session: ResearchSession) -> ExportResult:
 
 def _session_to_export_dict(session: ResearchSession) -> dict[str, Any]:
     """Convert session to export-friendly dictionary."""
+    has_report_text = bool((session.report_text or "").strip())
     return {
         "interaction_id": session.interaction_id,
         "query": session.query,
         "title": session.title,
         "summary": session.summary,
         "report_text": session.report_text,
+        "has_report_text": has_report_text,
+        "export_warning": None if has_report_text else EMPTY_REPORT_WARNING,
         "format_instructions": session.format_instructions,
         "agent_name": session.agent_name,
         "duration_seconds": session.duration_seconds,

@@ -6,7 +6,7 @@
 
 MCP server for AI-powered research using **Gemini**. Fast grounded search, URL extraction, comprehensive Deep Research, and session management.
 
-FastMCP 3.1 now exposes a compact BM25 tool-search surface by default. Clients see `research_web`, `research_deep`, `search_tools`, and `call_tool`; utility tools such as URL reading, follow-up, resume, sessions, templates, and export are discovered on demand.
+FastMCP 3.4 exposes a compact BM25 tool-search surface by default. Clients see `research_web`, `research_deep`, `search_tools`, and `call_tool`; utility tools such as URL reading, follow-up, resume, sessions, templates, and export are discovered on demand.
 
 ## Architecture
 

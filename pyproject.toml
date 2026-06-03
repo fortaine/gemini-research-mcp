@@ -33,9 +33,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "google-genai>=2.6.0",
-    # FastMCP 3.1+ required for BM25 tool search transforms
-    "fastmcp[tasks]>=3.2.4",
+    "google-genai>=2.7.0,<3",
+    # FastMCP 3.4+ tested for BM25 tool search transforms and task support
+    "fastmcp[tasks]>=3.4.0,<4",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.1",
     # Persistent storage using industry-standard key-value interface (used by FastMCP, agentpool, etc.)
@@ -94,6 +94,11 @@ source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gemini_research_mcp"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/vscode-extension/node_modules",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -5,6 +5,8 @@ import pytest
 
 from gemini_research_mcp import deep
 from gemini_research_mcp.deep import (
+    _extract_text_from_interaction,
+    _extract_usage,
     analyze_mcp_tool_for_gemini,
     build_interactions_tools,
     deep_research_stream,
@@ -37,6 +39,109 @@ def test_build_interactions_tools_combines_file_search_and_mcp() -> None:
             "allowed_tools": [{"tools": ["market_get_mission", "market_generate_report"]}],
         },
     ]
+
+
+def test_extract_text_from_interaction_steps_model_output() -> None:
+    interaction = SimpleNamespace(
+        steps=[
+            SimpleNamespace(
+                type="user_input",
+                content=[SimpleNamespace(type="text", text="User prompt")],
+            ),
+            SimpleNamespace(
+                type="model_output",
+                content=[SimpleNamespace(type="text", text="First report section.")],
+            ),
+            SimpleNamespace(
+                type="model_output",
+                content=[
+                    SimpleNamespace(type="image"),
+                    SimpleNamespace(type="text", text="Second report section."),
+                ],
+            ),
+        ]
+    )
+
+    assert (
+        _extract_text_from_interaction(interaction)
+        == "First report section.\n\nSecond report section."
+    )
+
+
+def test_extract_text_from_interaction_prefers_output_text() -> None:
+    interaction = SimpleNamespace(
+        output_text="Official SDK output text.",
+        steps=[
+            SimpleNamespace(
+                type="model_output",
+                content=[SimpleNamespace(type="text", text="Manual fallback text.")],
+            ),
+        ],
+    )
+
+    assert _extract_text_from_interaction(interaction) == "Official SDK output text."
+
+
+def test_extract_text_from_interaction_dict_steps() -> None:
+    interaction = {
+        "steps": [
+            {"type": "thought", "content": [{"type": "text", "text": "private thought"}]},
+            {
+                "type": "model_output",
+                "content": [{"type": "text", "text": "Final dict report."}],
+            },
+        ]
+    }
+
+    assert _extract_text_from_interaction(interaction) == "Final dict report."
+
+
+def test_extract_text_from_interaction_skips_reasoning_content() -> None:
+    interaction = {
+        "steps": [
+            {
+                "type": "model_output",
+                "content": [
+                    {"type": "thinking", "text": "hidden reasoning"},
+                    {"type": "text", "thought": True, "text": "hidden thought"},
+                    {"type": "text", "text": "Visible final answer."},
+                ],
+            },
+        ]
+    }
+
+    assert _extract_text_from_interaction(interaction) == "Visible final answer."
+
+
+def test_extract_text_from_interaction_legacy_outputs_fallback() -> None:
+    interaction = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(text="Legacy output one."),
+            SimpleNamespace(content="Legacy output two."),
+        ]
+    )
+
+    assert (
+        _extract_text_from_interaction(interaction)
+        == "Legacy output one.\n\nLegacy output two."
+    )
+
+
+def test_extract_usage_supports_interactions_usage_fields() -> None:
+    interaction = SimpleNamespace(
+        usage=SimpleNamespace(
+            total_input_tokens=11,
+            total_output_tokens=22,
+            total_tokens=33,
+        )
+    )
+
+    usage = _extract_usage(interaction)
+
+    assert usage is not None
+    assert usage.prompt_tokens == 11
+    assert usage.completion_tokens == 22
+    assert usage.total_tokens == 33
 
 
 def test_build_interactions_tools_rejects_non_https_remote_mcp() -> None:

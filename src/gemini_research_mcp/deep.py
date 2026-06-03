@@ -11,7 +11,7 @@ import asyncio
 import inspect
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -326,30 +326,71 @@ def _force_client_refresh() -> None:
     _client_health = None
 
 
+def _get_interaction_field(value: Any, field_name: str) -> Any:
+    """Read an Interactions SDK field from either a Pydantic model or dict."""
+    if isinstance(value, dict):
+        return value.get(field_name)
+    return getattr(value, field_name, None)
+
+
+def _as_sequence(value: Any) -> list[Any]:
+    """Normalize optional list-like SDK fields for safe iteration."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, Iterable) and not isinstance(
+        value, (str, bytes, bytearray, Mapping)
+    ):
+        return list(value)
+    return []
+
+
+def _is_reasoning_content(value: Any) -> bool:
+    """Return whether a text content item represents non-report reasoning."""
+    content_type = _get_interaction_field(value, "type")
+    if content_type in {"thought", "thinking", "reasoning"}:
+        return True
+    for field_name in ("thought", "thinking", "reasoning"):
+        if _get_interaction_field(value, field_name) is True:
+            return True
+    return False
+
+
 def _extract_usage(interaction: Any) -> DeepResearchUsage | None:
     """Extract usage/cost information from an interaction response."""
-    usage_data = getattr(interaction, "usage_metadata", None)
+    usage_data = _get_interaction_field(interaction, "usage_metadata")
 
     if usage_data is None:
-        usage_data = getattr(interaction, "usage", None)
+        usage_data = _get_interaction_field(interaction, "usage")
 
     if usage_data is None:
         return None
 
-    prompt_tokens = getattr(usage_data, "prompt_token_count", None)
+    prompt_tokens = _get_interaction_field(usage_data, "prompt_token_count")
     if prompt_tokens is None:
-        prompt_tokens = getattr(usage_data, "prompt_tokens", None)
+        prompt_tokens = _get_interaction_field(usage_data, "prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = _get_interaction_field(usage_data, "total_input_tokens")
 
-    completion_tokens = getattr(usage_data, "candidates_token_count", None)
+    completion_tokens = _get_interaction_field(usage_data, "candidates_token_count")
     if completion_tokens is None:
-        completion_tokens = getattr(usage_data, "completion_tokens", None)
+        completion_tokens = _get_interaction_field(usage_data, "completion_tokens")
+    if completion_tokens is None:
+        completion_tokens = _get_interaction_field(usage_data, "total_output_tokens")
 
-    total_tokens = getattr(usage_data, "total_token_count", None)
+    total_tokens = _get_interaction_field(usage_data, "total_token_count")
     if total_tokens is None:
-        total_tokens = getattr(usage_data, "total_tokens", None)
+        total_tokens = _get_interaction_field(usage_data, "total_tokens")
 
     raw_usage: dict[str, Any] = {}
-    if hasattr(usage_data, "__dict__"):
+    if hasattr(usage_data, "model_dump"):
+        raw_usage = usage_data.model_dump(mode="json")
+    elif isinstance(usage_data, dict):
+        raw_usage = usage_data
+    elif hasattr(usage_data, "__dict__"):
         raw_usage = vars(usage_data)
     elif hasattr(usage_data, "to_dict"):
         raw_usage = usage_data.to_dict()
@@ -364,15 +405,39 @@ def _extract_usage(interaction: Any) -> DeepResearchUsage | None:
 
 def _extract_text_from_interaction(interaction: Any) -> str | None:
     """Extract the final text output from an interaction."""
-    outputs = getattr(interaction, "outputs", [])
-    if outputs:
-        last_output = outputs[-1]
-        if hasattr(last_output, "text"):
-            text = last_output.text
-            return str(text) if text is not None else None
-        if hasattr(last_output, "content"):
-            content = last_output.content
-            return str(content) if content is not None else None
+    output_text = _get_interaction_field(interaction, "output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    text_parts: list[str] = []
+
+    for step in _as_sequence(_get_interaction_field(interaction, "steps")):
+        step_type = _get_interaction_field(step, "type")
+        if step_type != "model_output":
+            continue
+        for item in _as_sequence(_get_interaction_field(step, "content")):
+            if _is_reasoning_content(item):
+                continue
+            text = _get_interaction_field(item, "text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text)
+
+    if text_parts:
+        return "\n\n".join(text_parts)
+
+    outputs = _as_sequence(_get_interaction_field(interaction, "outputs"))
+    legacy_text_parts: list[str] = []
+    for output in outputs:
+        text = _get_interaction_field(output, "text")
+        if isinstance(text, str) and text.strip():
+            legacy_text_parts.append(text)
+            continue
+        content = _get_interaction_field(output, "content")
+        if isinstance(content, str) and content.strip():
+            legacy_text_parts.append(content)
+    if legacy_text_parts:
+        return "\n\n".join(legacy_text_parts)
+
     return None
 
 
@@ -974,9 +1039,7 @@ async def deep_research(
 
                 if status == "completed":
                     raw_interaction = final_interaction
-                    outputs = getattr(final_interaction, "outputs", None)
-                    if outputs and len(outputs) > 0:
-                        final_text = getattr(outputs[-1], "text", "") or ""
+                    final_text = _extract_text_from_interaction(final_interaction) or ""
                     break
 
                 elif status in ("cancelled", "canceled"):

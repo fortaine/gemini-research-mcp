@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "gemini-research-mcp",
   "display_name": "Gemini Research",
-  "version": "0.13.0",
-  "description": "AI-powered research using Gemini with FastMCP 3.1 BM25 tool search and Deep Research",
-  "long_description": "MCP server providing AI-powered research capabilities using Google Gemini with a FastMCP 3.1 BM25 tool-search surface:\n\n- **research_web**: Fast web research with Gemini grounding (5-30 seconds)\n- **research_deep**: Comprehensive autonomous research agent (3-20 minutes)\n- **search_tools**: Discover utility tools for URL reading, templates, sessions, follow-up, resume, and export\n- **call_tool**: Execute a discovered utility tool by name\n\nUtility tools remain directly callable for clients that already know the tool name.",
+  "version": "0.15.0",
+  "description": "AI-powered research using Gemini with FastMCP 3.4 tool search and Deep Research report recovery",
+  "long_description": "MCP server providing AI-powered research capabilities using Google Gemini with a FastMCP 3.4 BM25 tool-search surface and google-genai 2.7 Interactions compatibility:\n\n- **research_web**: Fast web research with Gemini grounding (5-30 seconds)\n- **research_deep**: Comprehensive autonomous research agent (3-20 minutes) with recoverable session storage and modern steps/output_text report extraction\n- **search_tools**: Discover utility tools for URL reading, templates, sessions, follow-up, resume, and export\n- **call_tool**: Execute a discovered utility tool by name\n\nUtility tools remain directly callable for clients that already know the tool name.",
   "author": {
     "name": "Guillaume Fortaine",
     "email": "guillaume.fortaine+github@machinemates.ai",
