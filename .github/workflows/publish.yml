@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       test_pypi:
-        description: 'Publish to TestPyPI instead of PyPI'
-        required: false
-        default: false
+        description: 'Publish to TestPyPI (required - this workflow can never publish to production PyPI via manual dispatch)'
+        required: true
+        default: true
         type: boolean
 
 jobs:
@@ -31,8 +31,11 @@ jobs:
       - name: Run tests
         run: uv run pytest -v --tb=short
 
+      - name: Run tests (FastMCP camelCase compat shim disabled)
+        run: FASTMCP_MCP_CAMELCASE_COMPAT=false uv run pytest -v --tb=short
+
       - name: Run linter
-        run: uv run ruff check src/
+        run: uv run ruff check src/ tests/
 
       - name: Run type checker
         run: uv run mypy src/
@@ -40,17 +43,67 @@ jobs:
       - name: Build package
         run: uv build
 
-      - name: Upload Python artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
+      - name: Verify built artifacts do not leak secrets or local caches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          forbidden_pattern='\.env$|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.DS_Store|node_modules|realistic-'
+          for archive in dist/*.whl dist/*.tar.gz; do
+            echo "Inspecting ${archive}"
+            if [[ "$archive" == *.whl ]]; then
+              listing=$(python -m zipfile -l "$archive")
+            else
+              listing=$(tar -tzf "$archive")
+            fi
+            if echo "$listing" | grep -E -i "$forbidden_pattern"; then
+              echo "::error::${archive} contains a forbidden file (secret or local cache artifact)"
+              exit 1
+            fi
+          done
+          echo "No forbidden files found in built artifacts."
+
+      - name: Verify the git tag, built package version, and manifest.json agree
+        if: github.event_name == 'release'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          wheel_version=$(ls dist/*.whl | sed -E 's/.*gemini_research_mcp-([0-9][^-]*)-py3.*/\1/')
+          echo "tag=${tag} wheel_version=${wheel_version}"
+          if [ "$tag" != "$wheel_version" ]; then
+            echo "::error::Release tag v${tag} does not match built wheel version ${wheel_version}. Refusing to publish."
+            exit 1
+          fi
+          manifest_version=$(python -c "import json; print(json.load(open('manifest.json'))['version'])")
+          # manifest.json uses MCPB's "x.y.z-beta.N" convention; PEP 440 uses "x.y.zbN".
+          normalized_manifest=$(printf '%s' "$manifest_version" | sed -E 's/-beta\.?/b/; s/-rc\.?/rc/; s/-alpha\.?/a/')
+          echo "manifest_version=${manifest_version} normalized=${normalized_manifest}"
+          if [ "$normalized_manifest" != "$tag" ]; then
+            echo "::error::manifest.json version ${manifest_version} does not match release tag v${tag}. Refusing to publish."
+            exit 1
+          fi
+          echo "Version check passed: tag, wheel, and manifest.json agree."
 
       - name: Install mcpb CLI
         run: npm install -g @anthropic-ai/mcpb
 
       - name: Build MCPB bundle
         run: mcpb pack . gemini-research-mcp.mcpb
+
+      - name: Verify MCPB bundle does not leak secrets or local caches
+        run: |
+          set -euo pipefail
+          forbidden_pattern='\.env$|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.DS_Store|node_modules|realistic-'
+          if python -m zipfile -l gemini-research-mcp.mcpb | grep -E -i "$forbidden_pattern"; then
+            echo "::error::gemini-research-mcp.mcpb contains a forbidden file (secret or local cache artifact)"
+            exit 1
+          fi
+          echo "No forbidden files found in the MCPB bundle."
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Upload MCPB artifact
         uses: actions/upload-artifact@v4
@@ -80,7 +133,11 @@ jobs:
 
   publish-pypi:
     needs: build
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.test_pypi)
+    # Production PyPI can ONLY be published from an actual GitHub Release being
+    # published - never from a manual workflow_dispatch. This prevents anyone
+    # with Actions write access from shipping to production without going
+    # through the release process (tag, changelog, review).
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -112,3 +169,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: gemini-research-mcp.mcpb
+

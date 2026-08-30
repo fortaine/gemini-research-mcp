@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "gemini-research-mcp",
   "display_name": "Gemini Research",
-  "version": "0.15.0",
+  "version": "0.16.0-beta.1",
   "description": "AI-powered research using Gemini 3.7 and FastMCP 4 with compact tool search and recoverable Deep Research",
   "long_description": "MCP server providing AI-powered research capabilities using Google Gemini 3.7 and FastMCP 4.0.0b5:\n\n- **research_web**: Fast web research with Gemini grounding (5-30 seconds)\n- **research_deep**: Autonomous research with recoverable session storage and modern steps/output_text report extraction\n- **research_deep_max**: Maximum-comprehensiveness research with visualization and collaborative planning\n- **search_tools** / **call_tool**: Compact BM25 discovery and invocation of utility tools\n- **resume_research** / **export_research_session**: Recover sessions and persist Markdown, JSON, or DOCX artifacts\n\nThe server supports stdio and guarded streamable HTTP transports plus shared Disk/Redis storage.",
   "author": {

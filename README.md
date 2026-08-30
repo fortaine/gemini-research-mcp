@@ -280,6 +280,16 @@ needs a specialized/private data source.
 > calls; use `research_deep_max` or set
 > `DEEP_RESEARCH_AGENT=deep-research-max-preview-04-2026`. See
 > <https://github.com/googleapis/python-genai/issues/2126>.
+>
+> **Known limitation (live-verified):** even on `research_deep_max`, the
+> provider-side agent may call the remote MCP tool successfully (confirmed via
+> server-side access logs) yet fail to ground its final report in the
+> returned data — paraphrasing a marker token instead of quoting it verbatim,
+> or omitting specific evidence IDs/facts from a retrieved evidence ledger.
+> This is preview-API agent behavior, not a bug in this package. Treat
+> `research_deep_max` MCP evidence as best-effort: always verify citations
+> against your own audit/quarantine path before trusting a report for
+> decisions.
 
 Example `research_deep_max` `mcp_servers` argument:
 

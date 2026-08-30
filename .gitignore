@@ -31,3 +31,9 @@ build/
 
 # Review files
 *review.md
+
+# Local/generated E2E artifacts (never commit raw research output)
+realistic-*.md
+realistic-*.json
+*-raw-output.md
+*-raw-tool-outputs.md

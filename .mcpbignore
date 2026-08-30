@@ -57,3 +57,9 @@ scripts/
 *.log
 *.tmp
 *~
+
+# Local/generated E2E artifacts (never ship in the bundle)
+realistic-*.md
+realistic-*.json
+*-raw-output.md
+*-raw-tool-outputs.md
