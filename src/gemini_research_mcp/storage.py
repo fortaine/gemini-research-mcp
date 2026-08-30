@@ -23,11 +23,12 @@ import time
 from collections.abc import Coroutine
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, TypeVar
 
 import platformdirs
+from key_value.aio.stores.base import BaseStore
 from key_value.aio.stores.disk import DiskStore
 
 from gemini_research_mcp.config import LOGGER_NAME
@@ -50,8 +51,24 @@ FREE_TIER_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 # Application name for platformdirs
 APP_NAME = "gemini-research-mcp"
 
-# Storage collection name (DiskStore uses this as filename prefix)
+# Storage collection names (namespaces within the key-value backend)
 SESSIONS_COLLECTION = "sessions"
+EXPORTS_COLLECTION = "exports"
+
+# Env var pointing at a shared backend (e.g. "redis://host:6379/0"). When
+# unset, storage falls back to the local, zero-configuration disk backend.
+STORAGE_URL_ENV_VAR = "GEMINI_RESEARCH_STORAGE_URL"
+
+
+def get_storage_backend_url() -> str | None:
+    """Return the configured shared-storage URL, or None for the local disk default.
+
+    Set GEMINI_RESEARCH_STORAGE_URL to a redis:// URL (requires the
+    `distributed` extra: `pip install gemini-research-mcp[distributed]`) to
+    make sessions and export artifacts shared across multiple server
+    instances/workers instead of being local to one process's disk.
+    """
+    return os.environ.get(STORAGE_URL_ENV_VAR) or None
 
 
 def get_storage_dir() -> Path:
@@ -73,6 +90,30 @@ def get_storage_dir() -> Path:
     return Path(platformdirs.user_data_dir(APP_NAME))
 
 
+def create_store(*, storage_dir: Path | None = None) -> BaseStore:
+    """Create the key-value backend: shared Redis when configured, else local disk.
+
+    This is the single place that decides between backends, so both
+    SessionStorage and ExportArtifactStore share identical selection logic
+    and both become shareable across processes/instances the moment
+    GEMINI_RESEARCH_STORAGE_URL is set - no other code needs to know which
+    backend is active.
+    """
+    url = get_storage_backend_url()
+    if url is not None:
+        # Imported lazily: redis is an optional dependency (the `distributed`
+        # extra) and must not be required for the default local-disk mode.
+        from key_value.aio.stores.redis.store import RedisStore
+
+        logger.info("💾 Using shared storage backend (Redis) from %s", STORAGE_URL_ENV_VAR)
+        return RedisStore(url=url)
+
+    directory = storage_dir or get_storage_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    logger.debug("💾 Using local disk storage backend at %s", directory)
+    return DiskStore(directory=str(directory))
+
+
 def get_ttl_seconds() -> int:
     """Get TTL from env or default (55 days for paid tier)."""
     custom_ttl = os.environ.get("GEMINI_RESEARCH_TTL_SECONDS")
@@ -89,7 +130,7 @@ def get_ttl_seconds() -> int:
 # =============================================================================
 
 
-class ResearchStatus(str, Enum):
+class ResearchStatus(StrEnum):
     """Status of a research session for resume functionality."""
 
     IN_PROGRESS = "in_progress"  # Research started, not yet completed
@@ -97,6 +138,12 @@ class ResearchStatus(str, Enum):
     FAILED = "failed"  # Research failed with error
     INTERRUPTED = "interrupted"  # Research interrupted (VS Code disconnected, etc.)
     CANCELLED = "cancelled"  # Research cancelled by provider or user
+    # Collaborative planning (agent_config.collaborative_planning=True) statuses.
+    # These sit between IN_PROGRESS and COMPLETED/FAILED/... in the lifecycle:
+    # PLANNING -> AWAITING_APPROVAL -> EXECUTING -> COMPLETED (or FAILED/CANCELLED).
+    PLANNING = "planning"  # Agent is drafting the research plan
+    AWAITING_APPROVAL = "awaiting_approval"  # Plan delivered; needs refine/approve
+    EXECUTING = "executing"  # Plan approved; final report is being generated
 
 
 @dataclass
@@ -117,6 +164,8 @@ class ResearchSession:
     tags: list[str] = field(default_factory=list)
     notes: str | None = None  # User-added notes
     status: ResearchStatus = ResearchStatus.COMPLETED  # For resume functionality
+    plan_text: str | None = None  # Draft plan while PLANNING/AWAITING_APPROVAL
+    image_export_ids: list[str] = field(default_factory=list)  # Persisted image artifacts
 
     def __post_init__(self) -> None:
         """Set expiration if not provided."""
@@ -213,6 +262,8 @@ class ResearchSession:
             tags=data.get("tags", []),
             notes=data.get("notes"),
             status=ResearchStatus(data.get("status", "completed")),
+            plan_text=data.get("plan_text"),
+            image_export_ids=data.get("image_export_ids", []),
         )
 
     @property
@@ -244,29 +295,50 @@ class SessionStorage:
     """
 
     def __init__(self, storage_dir: Path | None = None):
-        """Initialize storage with DiskStore backend."""
+        """Initialize storage, using a shared backend if GEMINI_RESEARCH_STORAGE_URL is set."""
         self.storage_dir = storage_dir or get_storage_dir()
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self._store = DiskStore(directory=str(self.storage_dir))
+        self._store = create_store(storage_dir=self.storage_dir)
         logger.debug("💾 Storage initialized at %s", self.storage_dir)
 
     # -------------------------------------------------------------------------
-    # Key Enumeration (via underlying diskcache)
+    # Key Enumeration (backend-agnostic)
     # -------------------------------------------------------------------------
 
-    def _iter_session_keys(self) -> list[str]:
+    async def _iter_session_keys_async(self) -> list[str]:
         """
-        Iterate all session keys using diskcache's native iterkeys().
+        Enumerate all session keys, preferring the backend's public API.
 
-        DiskStore uses format: "{collection}::{key}" internally.
-        This is more elegant than maintaining a separate index.
+        RedisStore (and any future backend) exposes a public async `keys()`
+        method, which is used directly - this is what makes session
+        enumeration work identically whether sessions live on local disk or
+        in a shared Redis instance.
+
+        DiskStore does not expose a public enumeration method, so as a
+        best-effort fallback we still reach into diskcache's native
+        `iterkeys()` for that backend only. This keeps the private-attribute
+        access isolated to the one backend that requires it, instead of
+        being load-bearing for every backend.
         """
+        keys_method = getattr(self._store, "keys", None)
+        if callable(keys_method):
+            result: list[str] = await keys_method(collection=SESSIONS_COLLECTION)
+            return result
+
+        cache = getattr(self._store, "_cache", None)
+        if cache is None:
+            logger.warning(
+                "Storage backend %s exposes neither keys() nor a diskcache "
+                "fallback; session listing will be empty.",
+                type(self._store).__name__,
+            )
+            return []
+
         prefix = f"{SESSIONS_COLLECTION}::"
-        keys: list[str] = []
-        for raw_key in self._store._cache.iterkeys():
-            if isinstance(raw_key, str) and raw_key.startswith(prefix):
-                keys.append(raw_key[len(prefix):])
-        return keys
+        return [
+            raw_key[len(prefix):]
+            for raw_key in cache.iterkeys()
+            if isinstance(raw_key, str) and raw_key.startswith(prefix)
+        ]
 
     # -------------------------------------------------------------------------
     # Async Core Operations
@@ -325,7 +397,7 @@ class SessionStorage:
         """
         sessions: list[ResearchSession] = []
 
-        for interaction_id in self._iter_session_keys():
+        for interaction_id in await self._iter_session_keys_async():
             data = await self._store.get(interaction_id, collection=SESSIONS_COLLECTION)
             if data is None:
                 continue
@@ -374,6 +446,8 @@ class SessionStorage:
         report_text: str | None = None,
         duration_seconds: float | None = None,
         total_tokens: int | None = None,
+        plan_text: str | None = None,
+        image_export_ids: list[str] | None = None,
     ) -> ResearchSession | None:
         """Update session metadata (async)."""
         session = await self.get_session_async(interaction_id)
@@ -396,6 +470,10 @@ class SessionStorage:
             session.duration_seconds = duration_seconds
         if total_tokens is not None:
             session.total_tokens = total_tokens
+        if plan_text is not None:
+            session.plan_text = plan_text
+        if image_export_ids is not None:
+            session.image_export_ids = image_export_ids
 
         await self.save_session_async(session)
         return session
@@ -404,7 +482,7 @@ class SessionStorage:
         """Remove all expired sessions (async). Returns count of removed sessions."""
         expired_ids: list[str] = []
 
-        for interaction_id in self._iter_session_keys():
+        for interaction_id in await self._iter_session_keys_async():
             data = await self._store.get(interaction_id, collection=SESSIONS_COLLECTION)
             if data is None:
                 # Already expired/removed by TTL
@@ -493,6 +571,8 @@ class SessionStorage:
         report_text: str | None = None,
         duration_seconds: float | None = None,
         total_tokens: int | None = None,
+        plan_text: str | None = None,
+        image_export_ids: list[str] | None = None,
     ) -> ResearchSession | None:
         """Update session metadata (sync wrapper)."""
         return self._run_async(
@@ -506,6 +586,8 @@ class SessionStorage:
                 report_text=report_text,
                 duration_seconds=duration_seconds,
                 total_tokens=total_tokens,
+                plan_text=plan_text,
+                image_export_ids=image_export_ids,
             )
         )
 
@@ -551,6 +633,8 @@ def save_research_session(
     total_tokens: int | None = None,
     tags: list[str] | None = None,
     status: ResearchStatus = ResearchStatus.COMPLETED,
+    plan_text: str | None = None,
+    image_export_ids: list[str] | None = None,
 ) -> ResearchSession:
     """
     Save a research session for later follow-up.
@@ -567,6 +651,8 @@ def save_research_session(
         total_tokens: Optional total tokens used
         tags: Optional tags for filtering
         status: Session status (default: COMPLETED)
+        plan_text: Optional collaborative-planning draft plan text
+        image_export_ids: Optional export IDs of persisted Deep Research images
 
     Returns:
         The saved ResearchSession
@@ -584,6 +670,8 @@ def save_research_session(
         total_tokens=total_tokens,
         tags=tags or [],
         status=status,
+        plan_text=plan_text,
+        image_export_ids=image_export_ids or [],
     )
     get_storage().save_session(session)
     return session
@@ -600,6 +688,8 @@ def update_research_session(
     tags: list[str] | None = None,
     notes: str | None = None,
     status: ResearchStatus | None = None,
+    plan_text: str | None = None,
+    image_export_ids: list[str] | None = None,
 ) -> ResearchSession | None:
     """
     Update an existing research session.
@@ -614,6 +704,8 @@ def update_research_session(
         tags: Optional new tags
         notes: Optional user notes
         status: Optional new status
+        plan_text: Optional collaborative-planning draft plan text
+        image_export_ids: Optional export IDs of persisted Deep Research images
 
     Returns:
         The updated ResearchSession or None if not found
@@ -628,6 +720,8 @@ def update_research_session(
         tags=tags,
         notes=notes,
         status=status,
+        plan_text=plan_text,
+        image_export_ids=image_export_ids,
     )
 
 
@@ -665,3 +759,145 @@ def list_research_sessions(
         tags=tags,
         limit=limit,
     )
+
+
+# =============================================================================
+# Export Artifact Storage
+#
+# Backed by the same shared/local backend selection as SessionStorage (see
+# create_store()), so an export created on one instance is downloadable from
+# another the moment GEMINI_RESEARCH_STORAGE_URL points them at the same
+# Redis backend. Replaces the old in-memory `_export_cache` dict, which did
+# not survive a restart and could not be shared across workers.
+# =============================================================================
+
+# Default TTL for exported files (1 hour) - short-lived, download-once artifacts.
+DEFAULT_EXPORT_TTL_SECONDS = 3600
+
+
+@dataclass
+class ExportArtifact:
+    """A persisted export artifact (Markdown/JSON/DOCX report bytes + metadata)."""
+
+    export_id: str
+    session_id: str
+    filename: str
+    format: str
+    mime_type: str
+    content_b64: str  # base64-encoded bytes, for JSON-serializable storage
+    created_at: float  # Unix timestamp
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExportArtifact:
+        return cls(
+            export_id=data["export_id"],
+            session_id=data["session_id"],
+            filename=data["filename"],
+            format=data["format"],
+            mime_type=data["mime_type"],
+            content_b64=data["content_b64"],
+            created_at=data["created_at"],
+        )
+
+    @property
+    def content(self) -> bytes:
+        import base64
+
+        return base64.b64decode(self.content_b64)
+
+    @property
+    def size_human(self) -> str:
+        size: float = len(self.content)
+        for unit in ["B", "KB", "MB"]:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} GB"
+
+
+class ExportArtifactStore:
+    """Persistent, TTL-bounded storage for exported research reports."""
+
+    def __init__(
+        self, storage_dir: Path | None = None, *, ttl_seconds: int = DEFAULT_EXPORT_TTL_SECONDS
+    ):
+        self.storage_dir = storage_dir or get_storage_dir()
+        self.ttl_seconds = ttl_seconds
+        self._store = create_store(storage_dir=self.storage_dir)
+
+    async def save_async(
+        self,
+        *,
+        session_id: str,
+        filename: str,
+        format: str,
+        mime_type: str,
+        content: bytes,
+    ) -> str:
+        """Persist an export and return its unique export_id."""
+        import base64
+        import uuid
+
+        export_id = str(uuid.uuid4())[:12]
+        artifact = ExportArtifact(
+            export_id=export_id,
+            session_id=session_id,
+            filename=filename,
+            format=format,
+            mime_type=mime_type,
+            content_b64=base64.b64encode(content).decode("ascii"),
+            created_at=time.time(),
+        )
+        await self._store.put(
+            export_id,
+            artifact.to_dict(),
+            ttl=self.ttl_seconds,
+            collection=EXPORTS_COLLECTION,
+        )
+        return export_id
+
+    async def get_async(self, export_id: str) -> ExportArtifact | None:
+        """Retrieve an export by ID, or None if missing/expired (TTL-enforced by backend)."""
+        data = await self._store.get(export_id, collection=EXPORTS_COLLECTION)
+        if data is None:
+            return None
+        return ExportArtifact.from_dict(data)
+
+    async def list_async(self) -> list[ExportArtifact]:
+        """List all currently live (non-expired) exports, newest first."""
+        keys_method = getattr(self._store, "keys", None)
+        if callable(keys_method):
+            export_ids: list[str] = await keys_method(collection=EXPORTS_COLLECTION)
+        else:
+            cache = getattr(self._store, "_cache", None)
+            if cache is None:
+                return []
+            prefix = f"{EXPORTS_COLLECTION}::"
+            export_ids = [
+                raw_key[len(prefix):]
+                for raw_key in cache.iterkeys()
+                if isinstance(raw_key, str) and raw_key.startswith(prefix)
+            ]
+
+        artifacts: list[ExportArtifact] = []
+        for export_id in export_ids:
+            artifact = await self.get_async(export_id)
+            if artifact is not None:
+                artifacts.append(artifact)
+
+        artifacts.sort(key=lambda a: a.created_at, reverse=True)
+        return artifacts
+
+
+_export_store: ExportArtifactStore | None = None
+
+
+def get_export_store() -> ExportArtifactStore:
+    """Get the global export artifact store instance."""
+    global _export_store
+    if _export_store is None:
+        _export_store = ExportArtifactStore()
+    return _export_store

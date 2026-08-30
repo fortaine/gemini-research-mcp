@@ -8,6 +8,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "e2e: mark test as end-to-end (requires API key)"
     )
+    config.addinivalue_line(
+        "markers", "redis: mark test as requiring a live Redis/Valkey instance"
+    )
 
 
 @pytest.fixture(scope="session")

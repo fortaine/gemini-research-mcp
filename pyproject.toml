@@ -33,15 +33,25 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "google-genai>=2.7.0,<3",
-    # FastMCP 3.4+ tested for BM25 tool search transforms and task support
-    "fastmcp[tasks]>=3.4.0,<4",
+    # Latest stable google-genai SDK (verified against PyPI at implementation time)
+    "google-genai>=2.20.0,<3.0.0",
+    # FastMCP 4 beta: sessionless protocol (2026-07-28), Tasks extension, BM25 tool search
+    "fastmcp[tasks]==4.0.0b5",
     "httpx>=0.28.1",
     "python-dotenv>=1.2.1",
     # Persistent storage using industry-standard key-value interface (used by FastMCP, agentpool, etc.)
-    "py-key-value-aio[disk]>=0.4.0,<0.5.0",
+    "py-key-value-aio[disk]>=0.4.5,<0.5.0",
     # XDG-compliant platform-specific directories
     "platformdirs>=4.5.1",
+]
+
+[tool.uv]
+# uv only allows prereleases for packages explicitly named here. fastmcp-slim and
+# fastmcp-tasks are transitive dependencies of fastmcp[tasks] and must be pinned
+# to the exact same beta to keep resolution deterministic.
+constraint-dependencies = [
+    "fastmcp-slim==4.0.0b5",
+    "fastmcp-tasks==4.0.0b5",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +68,11 @@ docx = [
 web = [
     "trafilatura>=2.0.0",
     "protego>=0.3.1",
+]
+# Shared session/export/task storage across multiple server instances (stateless
+# HTTP deployments, horizontal scaling). Not required for local stdio usage.
+distributed = [
+    "py-key-value-aio[redis]>=0.4.5,<0.5.0",
 ]
 dev = [
     "pytest>=8.0.0",
@@ -106,8 +121,9 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 markers = [
     "e2e: end-to-end tests that require GEMINI_API_KEY",
+    "redis: opt-in tests requiring a live Redis/Valkey instance (GEMINI_RESEARCH_REDIS_TEST_URL)",
 ]
-addopts = "-m 'not e2e'"
+addopts = "-m 'not e2e and not redis'"
 
 [tool.mypy]
 strict = true

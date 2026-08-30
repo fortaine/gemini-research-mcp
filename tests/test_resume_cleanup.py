@@ -169,6 +169,37 @@ class TestResumeResearchStaleCleanup:
         # Session should still exist
         assert get_research_session(in_progress_session.interaction_id) is not None
 
+    @pytest.mark.asyncio
+    async def test_no_arg_listing_separates_recent_failed_and_stale_sessions(self) -> None:
+        """Listing should surface recent failed sessions without deleting stale ones."""
+        from gemini_research_mcp.server import resume_research
+        from gemini_research_mcp.storage import get_storage
+
+        save_research_session(
+            interaction_id="recent-failed-session",
+            query="Recent failed gateway timeout",
+            status=ResearchStatus.FAILED,
+        )
+        save_research_session(
+            interaction_id="stale-in-progress-session",
+            query="Old in-progress session",
+            status=ResearchStatus.IN_PROGRESS,
+        )
+
+        storage = get_storage()
+        stale = storage.get_session("stale-in-progress-session")
+        assert stale is not None
+        stale.created_at = time.time() - 90000
+        storage.save_session(stale)
+
+        result = await resume_research()
+        data = json.loads(result)
+
+        assert data["status"] == "recent_failed_sessions_found"
+        assert data["recent_failed_sessions"][0]["interaction_id"] == "recent-failed-session"
+        assert data["stale_sessions"][0]["interaction_id"] == "stale-in-progress-session"
+        assert get_research_session("stale-in-progress-session") is not None
+
 
 # =============================================================================
 # resume_research — Gemini API not-found cleanup
@@ -245,6 +276,95 @@ class TestResumeResearchNotFoundCleanup:
         assert data["status"] == "api_error"
         # Session should still exist (marked interrupted)
         session = get_research_session("test-generic-error")
+        assert session is not None
+        assert session.status == ResearchStatus.INTERRUPTED
+
+    @pytest.mark.asyncio
+    async def test_completed_without_report_stays_visible_for_recovery(self) -> None:
+        """A completed Gemini status with empty text should not be marked completed."""
+        from gemini_research_mcp.server import resume_research
+
+        save_research_session(
+            interaction_id="empty-completed-session",
+            query="Query that completed without report text",
+            status=ResearchStatus.IN_PROGRESS,
+        )
+
+        mock_interaction = SimpleNamespace(status="completed")
+        mock_result = SimpleNamespace(
+            raw_interaction=mock_interaction,
+            text="",
+            usage=SimpleNamespace(total_tokens=123),
+        )
+
+        async def passthrough_citations(result: object, resolve_urls: bool) -> object:
+            del resolve_urls
+            return result
+
+        with (
+            patch(
+                f"{SERVER_MODULE}.get_research_status",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
+            patch(
+                f"{SERVER_MODULE}.process_citations",
+                new=passthrough_citations,
+            ),
+        ):
+            result = await resume_research(interaction_id="empty-completed-session")
+
+        data = json.loads(result)
+        assert data["status"] == "completed_without_report"
+        assert data["resumable"] is True
+
+        session = get_research_session("empty-completed-session")
+        assert session is not None
+        assert session.status == ResearchStatus.INTERRUPTED
+        assert session.report_text is None
+        assert session.total_tokens == 123
+
+    @pytest.mark.asyncio
+    async def test_already_completed_without_stored_report_rechecks_gemini(self) -> None:
+        """Completed local sessions without report text should not short-circuit resume."""
+        from gemini_research_mcp.server import resume_research
+
+        save_research_session(
+            interaction_id="completed-empty-session",
+            query="Completed locally but report was not stored",
+            report_text="",
+            status=ResearchStatus.COMPLETED,
+        )
+
+        mock_interaction = SimpleNamespace(status="completed")
+        mock_result = SimpleNamespace(
+            raw_interaction=mock_interaction,
+            text="",
+            usage=None,
+        )
+
+        async def passthrough_citations(result: object, resolve_urls: bool) -> object:
+            del resolve_urls
+            return result
+
+        with (
+            patch(
+                f"{SERVER_MODULE}.get_research_status",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ) as get_status,
+            patch(
+                f"{SERVER_MODULE}.process_citations",
+                new=passthrough_citations,
+            ),
+        ):
+            result = await resume_research(interaction_id="completed-empty-session")
+
+        data = json.loads(result)
+        assert data["status"] == "completed_without_report"
+        get_status.assert_awaited_once_with("completed-empty-session")
+
+        session = get_research_session("completed-empty-session")
         assert session is not None
         assert session.status == ResearchStatus.INTERRUPTED
 

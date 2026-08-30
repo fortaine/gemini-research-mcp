@@ -25,7 +25,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,7 +45,15 @@ EMPTY_REPORT_WARNING = (
 )
 
 
-class ExportFormat(str, Enum):
+def _agent_name_value(agent_name: Any) -> str | None:
+    """Return the serializable agent ID for stored enum or legacy string values."""
+    if agent_name is None:
+        return None
+    value = getattr(agent_name, "value", None)
+    return str(value if value is not None else agent_name)
+
+
+class ExportFormat(StrEnum):
     """Supported export formats."""
 
     MARKDOWN = "markdown"
@@ -98,8 +106,9 @@ def _format_markdown_export(session: ResearchSession) -> str:
         lines.append(f"- **Duration:** {mins}m {secs}s")
     if session.total_tokens:
         lines.append(f"- **Tokens:** {session.total_tokens:,}")
-    if session.agent_name:
-        lines.append(f"- **Agent:** {session.agent_name}")
+    agent_name = _agent_name_value(session.agent_name)
+    if agent_name:
+        lines.append(f"- **Agent:** {agent_name}")
     if session.tags:
         lines.append(f"- **Tags:** {', '.join(session.tags)}")
     if session.notes:
@@ -127,6 +136,15 @@ def _format_markdown_export(session: ResearchSession) -> str:
         lines.append("## Report Unavailable")
         lines.append("")
         lines.append(EMPTY_REPORT_WARNING)
+        lines.append("")
+
+    # Images (persisted as export artifacts alongside the report; see
+    # `_persist_deep_research_images` in server.py / `research://exports/{id}`).
+    if session.image_export_ids:
+        lines.append("## Images")
+        lines.append("")
+        for i, export_id in enumerate(session.image_export_ids, start=1):
+            lines.append(f"- [Image {i}](research://exports/{export_id})")
         lines.append("")
 
     # Footer
@@ -169,11 +187,14 @@ def _session_to_export_dict(session: ResearchSession) -> dict[str, Any]:
         "has_report_text": has_report_text,
         "export_warning": None if has_report_text else EMPTY_REPORT_WARNING,
         "format_instructions": session.format_instructions,
-        "agent_name": session.agent_name,
+        "agent_name": _agent_name_value(session.agent_name),
         "duration_seconds": session.duration_seconds,
         "total_tokens": session.total_tokens,
         "tags": session.tags,
         "notes": session.notes,
+        "images": [
+            f"research://exports/{export_id}" for export_id in session.image_export_ids
+        ],
         "created_at": session.created_at_iso,
         "expires_at": session.expires_at_iso,
         "export_timestamp": datetime.now(tz=UTC).isoformat(),
@@ -1122,10 +1143,11 @@ def _add_cover_page(document: Any, session: ResearchSession) -> None:
         meta_para.paragraph_format.space_after = Pt(6)
 
     # Agent name
-    if session.agent_name:
+    agent_name = _agent_name_value(session.agent_name)
+    if agent_name:
         agent_para = document.add_paragraph()
         agent_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        agent_run = agent_para.add_run(f"AI Agent: {session.agent_name}")
+        agent_run = agent_para.add_run(f"AI Agent: {agent_name}")
         agent_run.font.name = "Calibri"
         agent_run.font.size = Pt(11)
         agent_run.font.color.rgb = SUBTLE_GRAY
@@ -1167,8 +1189,9 @@ def _add_metadata_table(document: Any, session: ResearchSession) -> None:
     if session.total_tokens:
         rows_data.append(("Tokens Used", f"{session.total_tokens:,}"))
 
-    if session.agent_name:
-        rows_data.append(("AI Agent", session.agent_name))
+    agent_name = _agent_name_value(session.agent_name)
+    if agent_name:
+        rows_data.append(("AI Agent", agent_name))
 
     if session.tags:
         rows_data.append(("Tags", ", ".join(session.tags)))

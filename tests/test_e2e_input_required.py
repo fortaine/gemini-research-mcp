@@ -37,6 +37,22 @@ class MockElicitResult:
         self.data = data
 
 
+def _legacy_ctx() -> MagicMock:
+    """Build a mock Context that exercises the handshake-era ctx.elicit() branch.
+
+    _uses_sessionless_guard_pattern() checks ctx.is_background_task and the
+    negotiated protocol version, so a bare MagicMock() (whose attributes are
+    truthy MagicMocks by default) would incorrectly route through the
+    sessionless InputRequiredResult guard pattern instead of ctx.elicit().
+    """
+    ctx = MagicMock()
+    ctx.is_background_task = False
+    ctx.request_context = MagicMock()
+    ctx.request_context.protocol_version = "2025-06-18"
+    ctx.input_responses = None
+    return ctx
+
+
 class TestElicitationIntegration:
     """Integration tests for elicitation during research_deep."""
 
@@ -47,7 +63,7 @@ class TestElicitationIntegration:
         from gemini_research_mcp.server import _maybe_clarify_query
 
         # Create a mock context with elicit method
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_data = MagicMock()
         mock_data.model_dump.return_value = {
             "answer_1": "web APIs and performance",
@@ -74,7 +90,7 @@ class TestElicitationIntegration:
         """User skipping clarification should proceed with original query."""
         from gemini_research_mcp.server import _maybe_clarify_query
 
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_ctx.elicit = AsyncMock(return_value=MockElicitResult("cancel", None))
 
         query = "compare python frameworks"
@@ -92,7 +108,7 @@ class TestElicitationIntegration:
         """Empty answers should proceed with original query."""
         from gemini_research_mcp.server import _maybe_clarify_query
 
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_data = MagicMock()
         mock_data.model_dump.return_value = {
             "answer_1": "",
@@ -115,7 +131,7 @@ class TestElicitationIntegration:
         """Specific queries should not trigger elicitation."""
         from gemini_research_mcp.server import _maybe_clarify_query
 
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_ctx.elicit = AsyncMock()
 
         # A specific, detailed query
@@ -137,7 +153,7 @@ class TestElicitationIntegration:
         """Elicitation failure should gracefully return original query."""
         from gemini_research_mcp.server import _maybe_clarify_query
 
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_ctx.elicit = AsyncMock(side_effect=RuntimeError("Elicitation not supported"))
 
         query = "compare python frameworks"
@@ -165,7 +181,7 @@ class TestResearchDeepWithElicitation:
 
         # Create mock context that provides clarification
         # All async methods must be AsyncMock
-        mock_ctx = MagicMock()
+        mock_ctx = _legacy_ctx()
         mock_data = MagicMock()
         mock_data.model_dump.return_value = {
             "answer_1": "Python web frameworks",

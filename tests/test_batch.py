@@ -142,12 +142,12 @@ async def run_single_test(query_info: dict, client: genai.Client, start_time: fl
             chunk_count += 1
             event_type = getattr(event, 'event_type', type(event).__name__)
             
-            if event_type == "interaction.start":
+            if event_type == "interaction.created":
                 if hasattr(event, 'interaction'):
                     interaction_id = getattr(event.interaction, 'id', None)
                 continue
             
-            if event_type == "content.delta":
+            if event_type == "step.delta":
                 delta = getattr(event, 'delta', None)
                 if delta:
                     delta_type = getattr(delta, 'type', None)
@@ -164,14 +164,16 @@ async def run_single_test(query_info: dict, client: genai.Client, start_time: fl
                                     start_time,
                                 )
                     elif delta_type == 'text':
-                        content = getattr(delta, 'content', None)
-                        if content:
-                            text_content = getattr(content, 'text', None)
-                            if text_content:
-                                text_chunks.append(text_content)
+                        text_content = getattr(delta, 'text', None)
+                        if not text_content:
+                            content = getattr(delta, 'content', None)
+                            if content:
+                                text_content = getattr(content, 'text', None)
+                        if text_content:
+                            text_chunks.append(text_content)
                 continue
             
-            if event_type == "interaction.complete":
+            if event_type == "interaction.completed":
                 if hasattr(event, 'interaction'):
                     final_status = getattr(event.interaction, 'status', None)
                     output = getattr(event.interaction, 'output', None)

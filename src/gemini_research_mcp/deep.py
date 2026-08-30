@@ -34,6 +34,7 @@ from gemini_research_mcp.config import (
     STREAM_RETRY_BACKOFF,
     get_api_key,
     get_deep_research_agent,
+    get_model,
     is_retryable_error,
 )
 from gemini_research_mcp.types import (
@@ -60,6 +61,14 @@ _GEMINI_UNSUPPORTED_MCP_SCHEMA_KEYWORDS = frozenset({
     "patternProperties",
     "then",
 })
+_MCP_REQUIRES_MAX_MESSAGE = (
+    "Remote MCP servers are currently supported only with Deep Research Max "
+    "deep-research-max-preview-04-2026. The standard "
+    "deep-research-preview-04-2026 agent has reproduced server-side "
+    "finalization/retrieval failures after MCP tool calls. Use "
+    "research_deep_max, or set DEEP_RESEARCH_AGENT=deep-research-max-preview-04-2026, "
+    "when passing mcp_servers."
+)
 
 
 def _validate_mcp_server_tool(server: dict[str, Any]) -> dict[str, Any]:
@@ -207,6 +216,16 @@ async def inspect_mcp_server_for_gemini(server: dict[str, Any]) -> dict[str, Any
         "issues": server_issues,
         "tools": tools,
     }
+
+
+def validate_mcp_servers_supported(
+    *,
+    agent_name: DeepResearchAgent,
+    mcp_servers: list[dict[str, Any]] | None,
+) -> None:
+    """Fail fast when remote MCP is requested for an agent without result-inclusion E2E."""
+    if mcp_servers and agent_name != DeepResearchAgent.DEEP_RESEARCH_MAX:
+        raise ValueError(_MCP_REQUIRES_MAX_MESSAGE)
 
 
 def build_interactions_tools(
@@ -359,6 +378,41 @@ def _is_reasoning_content(value: Any) -> bool:
     return False
 
 
+def _is_image_content(value: Any) -> bool:
+    """Return whether a content item is an image, so it is never merged into report text."""
+    return bool(_get_interaction_field(value, "type") == "image")
+
+
+def _extract_image_from_content(item: Any) -> dict[str, Any] | None:
+    """Normalize an image content item (final, non-streaming interaction) to a plain dict."""
+    if not _is_image_content(item):
+        return None
+    data = _get_interaction_field(item, "data")
+    mime_type = _get_interaction_field(item, "mime_type")
+    uri = _get_interaction_field(item, "uri")
+    if not data and not uri:
+        return None
+    return {
+        "data": data if isinstance(data, str) else None,
+        "mime_type": str(mime_type) if mime_type else None,
+        "uri": str(uri) if uri else None,
+    }
+
+
+def _extract_images_from_interaction(interaction: Any) -> list[dict[str, Any]]:
+    """Extract image content items from a completed interaction's model_output steps."""
+    images: list[dict[str, Any]] = []
+    for step in _as_sequence(_get_interaction_field(interaction, "steps")):
+        step_type = _get_interaction_field(step, "type")
+        if step_type != "model_output":
+            continue
+        for item in _as_sequence(_get_interaction_field(step, "content")):
+            image = _extract_image_from_content(item)
+            if image is not None:
+                images.append(image)
+    return images
+
+
 def _extract_usage(interaction: Any) -> DeepResearchUsage | None:
     """Extract usage/cost information from an interaction response."""
     usage_data = _get_interaction_field(interaction, "usage_metadata")
@@ -416,7 +470,7 @@ def _extract_text_from_interaction(interaction: Any) -> str | None:
         if step_type != "model_output":
             continue
         for item in _as_sequence(_get_interaction_field(step, "content")):
-            if _is_reasoning_content(item):
+            if _is_reasoning_content(item) or _is_image_content(item):
                 continue
             text = _get_interaction_field(item, "text")
             if isinstance(text, str) and text.strip():
@@ -486,6 +540,9 @@ async def deep_research_stream(
     file_search_store_names: list[str] | None = None,
     mcp_servers: list[dict[str, Any]] | None = None,
     agent_name: DeepResearchAgent | None = None,
+    visualization: str = "off",
+    collaborative_planning: bool = False,
+    previous_interaction_id: str | None = None,
 ) -> AsyncIterator[DeepResearchProgress]:
     """
     Stream deep research with real-time progress updates.
@@ -505,18 +562,28 @@ async def deep_research_stream(
         file_search_store_names: Optional list of file search store names for RAG
         mcp_servers: Optional remote MCP server tool configs for Deep Research
         agent_name: Deep Research agent to use
+        visualization: "off" (default) or "auto" - whether the Deep Research agent
+            may include chart/diagram images in its response (agent_config.visualization).
+        collaborative_planning: When True, the agent stops after drafting a research
+            plan and waits for approval before executing it (agent_config.
+            collaborative_planning). The stream ends with a "plan_ready" event
+            instead of "complete" (Interactions API status "requires_action").
+        previous_interaction_id: Continue a prior interaction (e.g. to refine or
+            approve a previously-returned plan). See CreateAgentInteraction.
 
     Yields:
         DeepResearchProgress events with type:
         - "start": Research started, includes interaction_id
         - "thought": Thinking summary from the agent
         - "text": Text delta from the final report
+        - "image": Image delta from the final report (never merged into text)
         - "complete": Research finished successfully
+        - "plan_ready": Research plan is ready and awaiting approval
+          (collaborative_planning=True only)
         - "error": Research failed
     """
-    # Use health-monitored client instead of creating new one each time
-    client = _get_healthy_client()
     agent_name = agent_name or get_deep_research_agent()
+    validate_mcp_servers_supported(agent_name=agent_name, mcp_servers=mcp_servers)
 
     prompt = f"{query}\n\n{format_instructions}" if format_instructions else query
 
@@ -533,10 +600,14 @@ async def deep_research_stream(
         "agent_config": {
             "type": "deep-research",
             "thinking_summaries": "auto",
+            "visualization": visualization,
+            "collaborative_planning": collaborative_planning,
         },
     }
     if tools:
         create_kwargs["tools"] = tools
+    if previous_interaction_id:
+        create_kwargs["previous_interaction_id"] = previous_interaction_id
 
     stream_start_time = time.time()
 
@@ -631,6 +702,29 @@ async def deep_research_stream(
                         interaction_id=interaction_id,
                         event_id=last_event_id,
                     )
+                elif delta_type == "image":
+                    # Image deltas must never be folded into the text report - yield a
+                    # dedicated "image" event carrying inline data or a hosted URI.
+                    if isinstance(delta, dict):
+                        image_data = delta.get("data")
+                        image_mime_type = delta.get("mime_type")
+                        image_uri = delta.get("uri")
+                    else:
+                        image_data = getattr(delta, "data", None)
+                        image_mime_type = getattr(delta, "mime_type", None)
+                        image_uri = getattr(delta, "uri", None)
+                    logger.debug(
+                        "[%.1fs] 🖼️ image delta: mime_type=%s, has_data=%s, has_uri=%s",
+                        elapsed, image_mime_type, bool(image_data), bool(image_uri),
+                    )
+                    yield DeepResearchProgress(
+                        event_type="image",
+                        content=str(image_data) if image_data else None,
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                        image_mime_type=str(image_mime_type) if image_mime_type else None,
+                        image_uri=str(image_uri) if image_uri else None,
+                    )
 
             elif chunk_type in ("interaction.complete", "interaction.completed"):
                 completed_interaction_id = _extract_interaction_id(chunk)
@@ -671,6 +765,17 @@ async def deep_research_stream(
                     yield DeepResearchProgress(
                         event_type="error",
                         content="Research failed on provider side.",
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                    )
+                elif interaction_status == "requires_action":
+                    is_complete = True
+                    logger.info(
+                        "[%.1fs] 🗓️ interaction.completed: requires_action (plan ready)",
+                        elapsed,
+                    )
+                    yield DeepResearchProgress(
+                        event_type="plan_ready",
                         interaction_id=interaction_id,
                         event_id=last_event_id,
                     )
@@ -717,6 +822,16 @@ async def deep_research_stream(
                     yield DeepResearchProgress(
                         event_type="error",
                         content=f"Research failed on provider side (status={status_update}).",
+                        interaction_id=interaction_id,
+                        event_id=last_event_id,
+                    )
+                elif status_update == "requires_action":
+                    is_complete = True
+                    logger.info(
+                        "[%.1fs] 🗓️ %s: requires_action (plan ready)", elapsed, chunk_type
+                    )
+                    yield DeepResearchProgress(
+                        event_type="plan_ready",
                         interaction_id=interaction_id,
                         event_id=last_event_id,
                     )
@@ -1100,6 +1215,7 @@ async def get_research_status(interaction_id: str) -> DeepResearchResult:
     status = getattr(interaction, "status", "unknown")
     text = _extract_text_from_interaction(interaction) if status == "completed" else None
     usage = _extract_usage(interaction)
+    images = _extract_images_from_interaction(interaction) if status == "completed" else []
 
     return DeepResearchResult(
         text=text or "",
@@ -1108,6 +1224,7 @@ async def get_research_status(interaction_id: str) -> DeepResearchResult:
         interaction_id=interaction_id,
         usage=usage,
         raw_interaction=interaction,
+        images=images,
     )
 
 
@@ -1115,7 +1232,7 @@ async def research_followup(
     previous_interaction_id: str,
     query: str,
     *,
-    model: str = "gemini-3.1-pro-preview",
+    model: str | None = None,
 ) -> str:
     """
     Ask a follow-up question about a completed Deep Research task.
@@ -1128,7 +1245,8 @@ async def research_followup(
         previous_interaction_id: Interaction ID from a completed research task
                                  (available as result.interaction_id from research_deep)
         query: The follow-up question
-        model: Model to use for the follow-up. Default: "gemini-3.1-pro-preview"
+        model: Model to use for the follow-up. Defaults to the configured
+               GEMINI_MODEL / DEFAULT_MODEL (currently gemini-3.7-flash).
 
     Returns:
         The text response to the follow-up question
@@ -1136,6 +1254,7 @@ async def research_followup(
     Raises:
         DeepResearchError: On invalid interaction ID or API errors
     """
+    model = model or get_model()
     logger.info("💬 Follow-up question for %s: %s", previous_interaction_id, query[:100])
 
     client = _get_healthy_client()  # Use health-monitored client

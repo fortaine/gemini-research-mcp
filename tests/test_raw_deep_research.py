@@ -122,15 +122,15 @@ async def run_deep_research(query: str) -> None:
             # Log raw event type
             log(f"📦 CHUNK #{chunk_count}: {event_type}")
             
-            # Handle interaction.start - get interaction_id
-            if event_type == "interaction.start":
+            # Handle interaction.created - get interaction_id
+            if event_type == "interaction.created":
                 if hasattr(event, 'interaction'):
                     interaction_id = getattr(event.interaction, 'id', None)
                     log(f"   interaction_id: {interaction_id}")
                 continue
             
-            # Handle content.delta - extract thinking summaries and text
-            if event_type == "content.delta":
+            # Handle step.delta - extract thinking summaries and text
+            if event_type == "step.delta":
                 delta = getattr(event, 'delta', None)
                 if delta:
                     delta_type = getattr(delta, 'type', None)
@@ -148,16 +148,18 @@ async def run_deep_research(query: str) -> None:
                                 )
                                 log(f"   🧠 Thought #{thought_count}: {summary}")
                     elif delta_type == 'text':
-                        content = getattr(delta, 'content', None)
-                        if content:
-                            text_content = getattr(content, 'text', None)
-                            if text_content:
-                                text_chunks.append(text_content)
-                                log(f"   📝 Text: {len(text_content)} chars")
+                        text_content = getattr(delta, 'text', None)
+                        if not text_content:
+                            content = getattr(delta, 'content', None)
+                            if content:
+                                text_content = getattr(content, 'text', None)
+                        if text_content:
+                            text_chunks.append(text_content)
+                            log(f"   📝 Text: {len(text_content)} chars")
                 continue
             
-            # Handle interaction.complete - get final status
-            if event_type == "interaction.complete":
+            # Handle interaction.completed - get final status
+            if event_type == "interaction.completed":
                 if hasattr(event, 'interaction'):
                     interaction = event.interaction
                     final_status = getattr(interaction, 'status', None)

@@ -658,76 +658,80 @@ class TestExportResult:
 
 
 class TestExportCache:
-    """Tests for ephemeral export cache used by MCP Resources."""
+    """Tests for the persistent export artifact store used by MCP Resources."""
 
-    def test_cache_export_returns_id(self, sample_session: ResearchSession) -> None:
+    @pytest.fixture(autouse=True)
+    def _isolated_export_store(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point the global export store at a throwaway directory for this test.
+
+        Without this, _cache_export/_get_cached_export (which use the module-
+        level singleton) would persist test data into the real, shared XDG
+        application-support directory.
+        """
+        import gemini_research_mcp.storage as storage_module
+
+        monkeypatch.setattr(
+            storage_module,
+            "_export_store",
+            storage_module.ExportArtifactStore(storage_dir=tmp_path),
+        )
+
+    @pytest.mark.asyncio
+    async def test_cache_export_returns_id(self, sample_session: ResearchSession) -> None:
         """Test caching an export returns a unique ID."""
-        from gemini_research_mcp.server import _cache_export, _export_cache
+        from gemini_research_mcp.server import _cache_export, _get_cached_export
 
         result = export_to_markdown(sample_session)
-        export_id = _cache_export(result, sample_session.interaction_id)
+        export_id = await _cache_export(result, sample_session.interaction_id)
 
         assert export_id is not None
         assert len(export_id) == 12  # UUID[:12]
-        assert export_id in _export_cache
+        assert await _get_cached_export(export_id) is not None
 
-        # Cleanup
-        del _export_cache[export_id]
-
-    def test_get_cached_export_returns_entry(
+    @pytest.mark.asyncio
+    async def test_get_cached_export_returns_entry(
         self, sample_session: ResearchSession
     ) -> None:
         """Test retrieving a cached export."""
-        from gemini_research_mcp.server import (
-            _cache_export,
-            _export_cache,
-            _get_cached_export,
-        )
+        from gemini_research_mcp.server import _cache_export, _get_cached_export
 
         result = export_to_markdown(sample_session)
-        export_id = _cache_export(result, sample_session.interaction_id)
+        export_id = await _cache_export(result, sample_session.interaction_id)
 
-        entry = _get_cached_export(export_id)
+        entry = await _get_cached_export(export_id)
         assert entry is not None
-        assert entry.result == result
+        assert entry.content == result.content
+        assert entry.filename == result.filename
         assert entry.session_id == sample_session.interaction_id
-        assert not entry.is_expired
 
-        # Cleanup
-        del _export_cache[export_id]
-
-    def test_get_cached_export_not_found(self) -> None:
+    @pytest.mark.asyncio
+    async def test_get_cached_export_not_found(self) -> None:
         """Test retrieving non-existent export returns None."""
         from gemini_research_mcp.server import _get_cached_export
 
-        entry = _get_cached_export("nonexistent-id")
+        entry = await _get_cached_export("nonexistent-id")
         assert entry is None
 
-    def test_export_resource_returns_mcp_types(
+    @pytest.mark.asyncio
+    async def test_export_resource_returns_mcp_types(
         self, sample_session: ResearchSession
     ) -> None:
         """Test the resource function returns proper MCP content types."""
         from mcp.types import TextResourceContents
 
-        from gemini_research_mcp.server import (
-            _cache_export,
-            _export_cache,
-            get_export_by_id,
-        )
+        from gemini_research_mcp.server import _cache_export, get_export_by_id
 
         # Test markdown returns TextResourceContents
         result = export_to_markdown(sample_session)
-        export_id = _cache_export(result, sample_session.interaction_id)
+        export_id = await _cache_export(result, sample_session.interaction_id)
 
-        content = get_export_by_id(export_id)
+        content = await get_export_by_id(export_id)
         assert isinstance(content, TextResourceContents)
-        assert content.mimeType == "text/markdown"
+        assert content.mime_type == "text/markdown"
         assert content.text == result.content.decode("utf-8")
 
-        # Cleanup
-        del _export_cache[export_id]
-
-    def test_export_resource_docx_returns_blob(
+    @pytest.mark.asyncio
+    async def test_export_resource_docx_returns_blob(
         self, sample_session: ResearchSession
     ) -> None:
         """Test DOCX export returns BlobResourceContents with base64."""
@@ -735,46 +739,37 @@ class TestExportCache:
 
         from mcp.types import BlobResourceContents
 
-        from gemini_research_mcp.server import (
-            _cache_export,
-            _export_cache,
-            get_export_by_id,
-        )
+        from gemini_research_mcp.server import _cache_export, get_export_by_id
 
         result = export_to_docx(sample_session)
-        export_id = _cache_export(result, sample_session.interaction_id)
+        export_id = await _cache_export(result, sample_session.interaction_id)
 
-        content = get_export_by_id(export_id)
+        content = await get_export_by_id(export_id)
         assert isinstance(content, BlobResourceContents)
-        assert content.mimeType == DOCX_MIME_TYPE
+        assert content.mime_type == DOCX_MIME_TYPE
         # Verify base64 decodes to original content
         decoded = base64.b64decode(content.blob)
         assert decoded == result.content
 
-        # Cleanup
-        del _export_cache[export_id]
-
-    def test_export_resource_raises_on_invalid_id(self) -> None:
+    @pytest.mark.asyncio
+    async def test_export_resource_raises_on_invalid_id(self) -> None:
         """Test resource raises ValueError for invalid export ID."""
         from gemini_research_mcp.server import get_export_by_id
 
         with pytest.raises(ValueError, match="Export not found"):
-            get_export_by_id("invalid-id-123")
+            await get_export_by_id("invalid-id-123")
 
-    def test_list_exports_returns_json(
+    @pytest.mark.asyncio
+    async def test_list_exports_returns_json(
         self, sample_session: ResearchSession
     ) -> None:
         """Test list_exports returns JSON with export metadata."""
-        from gemini_research_mcp.server import (
-            _cache_export,
-            _export_cache,
-            list_exports,
-        )
+        from gemini_research_mcp.server import _cache_export, list_exports
 
         result = export_to_markdown(sample_session)
-        export_id = _cache_export(result, sample_session.interaction_id)
+        export_id = await _cache_export(result, sample_session.interaction_id)
 
-        exports_json = list_exports()
+        exports_json = await list_exports()
         data = json.loads(exports_json)
 
         assert "exports" in data
@@ -791,39 +786,29 @@ class TestExportCache:
         assert "uri" in our_export
         assert our_export["uri"] == f"research://exports/{export_id}"
 
-        # Cleanup
-        del _export_cache[export_id]
-
-    def test_cache_cleans_up_expired_entries(
-        self, sample_session: ResearchSession
+    @pytest.mark.asyncio
+    async def test_export_survives_across_store_instances(
+        self, sample_session: ResearchSession, tmp_path
     ) -> None:
-        """Test that caching new exports cleans up expired entries."""
-        from datetime import UTC, datetime, timedelta
+        """An export saved via one ExportArtifactStore instance must be
+        readable from another instance pointed at the same backend - this is
+        the multi-worker/shared-storage guarantee from the modernization plan.
+        """
+        from gemini_research_mcp.storage import ExportArtifactStore
 
-        from gemini_research_mcp.server import (
-            EXPORT_TTL_SECONDS,
-            ExportCacheEntry,
-            _cache_export,
-            _export_cache,
+        result = export_to_markdown(sample_session)
+        store_a = ExportArtifactStore(storage_dir=tmp_path)
+        export_id = await store_a.save_async(
+            session_id=sample_session.interaction_id,
+            filename=result.filename,
+            format=result.format.value,
+            mime_type=result.mime_type,
+            content=result.content,
         )
 
-        # Create an expired entry manually
-        old_result = export_to_markdown(sample_session)
-        expired_entry = ExportCacheEntry(
-            result=old_result,
-            session_id="old-session",
-            created_at=datetime.now(UTC) - timedelta(seconds=EXPORT_TTL_SECONDS + 100),
-        )
-        _export_cache["expired-id"] = expired_entry
-        assert expired_entry.is_expired
+        store_b = ExportArtifactStore(storage_dir=tmp_path)
+        entry = await store_b.get_async(export_id)
 
-        # Cache a new export - should trigger cleanup
-        new_result = export_to_markdown(sample_session)
-        new_id = _cache_export(new_result, sample_session.interaction_id)
-
-        # Expired entry should be gone
-        assert "expired-id" not in _export_cache
-        assert new_id in _export_cache
-
-        # Cleanup
-        del _export_cache[new_id]
+        assert entry is not None
+        assert entry.content == result.content
+        assert entry.filename == result.filename

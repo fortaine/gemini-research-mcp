@@ -1,17 +1,16 @@
 import asyncio
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-
-mcp = FastMCP(
-    name="Protocol Test (official mcp.server.fastmcp)",
+mcp = MCPServer(
+    name="Protocol Test (official mcp.server.mcpserver)",
     instructions="Protocol-only test server.",
 )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True))
 async def progress_demo(
     steps: int = 5,
     delay_ms: int = 200,

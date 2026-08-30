@@ -25,15 +25,16 @@ LOGGER_NAME = "gemini-research-mcp"
 # =============================================================================
 
 # Default models - can be overridden via environment
-DEFAULT_MODEL = "gemini-3.1-pro-preview"
-# Interactions Deep Research agent.
+DEFAULT_MODEL = "gemini-3.7-flash"
+# Interactions Deep Research agent used by research_deep by default.
 DEFAULT_DEEP_RESEARCH_AGENT = DeepResearchAgent.DEEP_RESEARCH
 # Model for generating summaries (fast, cheap)
-DEFAULT_SUMMARY_MODEL = "gemini-3-flash-preview"
+DEFAULT_SUMMARY_MODEL = "gemini-3.7-flash"
 
 # Thinking level for Gemini 3 models
 # Values: "minimal", "low", "medium", "high"
-# - minimal: minimize latency for chat/high-throughput
+# - minimal: minimize latency for chat/high-throughput (gemini-3.1-* only;
+#   gemini-3.7-flash does not document "minimal", use "low" instead)
 # - low: balance speed and quality
 # - medium: good reasoning depth
 # - high: maximum reasoning depth (recommended for research)

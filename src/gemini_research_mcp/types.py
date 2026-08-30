@@ -5,7 +5,7 @@ Data types for Gemini Research MCP Server.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 # =============================================================================
@@ -13,7 +13,7 @@ from typing import Any
 # =============================================================================
 
 
-class ErrorCategory(str, Enum):
+class ErrorCategory(StrEnum):
     """Categorized error types for programmatic handling."""
 
     AUTH_ERROR = "AUTH_ERROR"  # API key invalid or missing
@@ -28,7 +28,7 @@ class ErrorCategory(str, Enum):
     API_ERROR = "API_ERROR"  # Other API errors
 
 
-class DeepResearchAgent(str, Enum):
+class DeepResearchAgent(StrEnum):
     """Supported agent for deep research."""
 
     DEEP_RESEARCH = "deep-research-preview-04-2026"
@@ -211,6 +211,7 @@ class DeepResearchResult:
     usage: DeepResearchUsage | None = None
     duration_seconds: float | None = None
     raw_interaction: Any = None
+    images: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -230,10 +231,17 @@ class DeepResearchResult:
 class DeepResearchProgress:
     """Progress update from streaming deep research."""
 
-    event_type: str  # "start", "thought", "text", "action", "complete", "error", "status"
-    content: str | None = None
+    # "start", "thought", "text", "image", "action", "complete", "plan_ready",
+    # "error", "status". "image" is distinct from "text" so image content/deltas
+    # are never concatenated into the report text. "plan_ready" is emitted when
+    # collaborative_planning=True and the agent is waiting for plan approval
+    # (Interactions API status "requires_action").
+    event_type: str
+    content: str | None = None  # For "image": base64-encoded data, when provided inline.
     interaction_id: str | None = None
     event_id: str | None = None  # For stream resumption after disconnection
+    image_mime_type: str | None = None  # For "image" events: e.g. "image/png".
+    image_uri: str | None = None  # For "image" events: hosted URI, when data isn't inlined.
 
 
 # =============================================================================

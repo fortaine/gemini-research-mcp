@@ -32,8 +32,8 @@ async def _run_protocol_checks(spec: _ServerSpec, *, supports_tool_tasks: bool) 
     async def message_handler(msg: Any) -> None:
         if not isinstance(msg, types.ServerNotification):
             return
-        if isinstance(msg.root, types.TaskStatusNotification):
-            task_status_notifications.append(str(msg.root.params.statusMessage))
+        if isinstance(msg, types.TaskStatusNotification):
+            task_status_notifications.append(str(msg.params.status_message))
 
     server = StdioServerParameters(
         command=sys.executable,
@@ -74,7 +74,7 @@ async def _run_protocol_checks(spec: _ServerSpec, *, supports_tool_tasks: bool) 
                     progress_callback=progress_callback,
                 )
 
-                assert call_result.isError is False
+                assert call_result.is_error is False
                 if supports_tool_tasks:
                     assert progress_messages or logging_messages
 
@@ -84,33 +84,45 @@ async def _run_protocol_checks(spec: _ServerSpec, *, supports_tool_tasks: bool) 
                 #   tools/call when params.task is provided (returns CallToolResult)
                 # - third-party fastmcp DOES create a task (returns CreateTaskResult)
                 # -----------------------------------------------------------------
-                task_req = types.ClientRequest(
-                    types.CallToolRequest(
-                        params=types.CallToolRequestParams(
-                            name="progress_demo",
-                            arguments={"steps": 3, "delay_ms": 80},
-                            task=types.TaskMetadata(ttl=30_000),
-                        )
+                task_req = types.CallToolRequest(
+                    params=types.CallToolRequestParams(
+                        name="progress_demo",
+                        arguments={"steps": 3, "delay_ms": 80},
+                        task=types.TaskMetadata(ttl=30_000),
                     )
                 )
 
                 if not supports_tool_tasks:
                     sync_result = await session.send_request(task_req, types.CallToolResult)
-                    assert sync_result.isError is False
+                    assert sync_result.is_error is False
                     checks_completed = True
                     return
 
-                created = await session.send_request(task_req, types.CreateTaskResult)
-                task_id = created.task.taskId
+                # FastMCP 4's task=optional mode may either create a background
+                # task (CreateTaskResult) or, if the tool completes fast enough,
+                # respond synchronously with a CallToolResult. Both are valid.
+                from pydantic import TypeAdapter
+
+                task_or_call_adapter: TypeAdapter[Any] = TypeAdapter(
+                    types.CreateTaskResult | types.CallToolResult
+                )
+                created = await session.send_request(task_req, task_or_call_adapter)
+
+                if isinstance(created, types.CallToolResult):
+                    assert created.is_error is False
+                    checks_completed = True
+                    return
+
+                task_id = created.task.task_id
 
                 seen_status_messages: list[str] = []
                 for _ in range(200):
-                    get_req = types.ClientRequest(
-                        types.GetTaskRequest(params=types.GetTaskRequestParams(taskId=task_id))
+                    get_req = types.GetTaskRequest(
+                        params=types.GetTaskRequestParams(task_id=task_id)
                     )
                     task = await session.send_request(get_req, types.GetTaskResult)
-                    if task.statusMessage:
-                        seen_status_messages.append(task.statusMessage)
+                    if task.status_message:
+                        seen_status_messages.append(task.status_message)
 
                     if task.status in ("completed", "failed", "cancelled"):
                         break

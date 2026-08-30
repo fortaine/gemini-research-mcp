@@ -1,12 +1,16 @@
 # Gemini Research MCP Server
 
 [![PyPI version](https://img.shields.io/pypi/v/gemini-research-mcp.svg)](https://pypi.org/project/gemini-research-mcp/)
+[![CI](https://github.com/machinemates-ai/gemini-research-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/machinemates-ai/gemini-research-mcp/actions/workflows/ci.yml)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 MCP server for AI-powered research using **Gemini**. Fast grounded search, URL extraction, comprehensive Deep Research, and session management.
 
-FastMCP 3.4 exposes a compact BM25 tool-search surface by default. Clients see `research_web`, `research_deep`, `search_tools`, and `call_tool`; utility tools such as URL reading, follow-up, resume, sessions, templates, and export are discovered on demand.
+Built on **FastMCP `4.0.0b5`** (beta, exact-pinned) with the modern sessionless
+MCP protocol, **Gemini `3.7 Flash`**, MCP Tasks (SEP-1732), the guard-pattern
+elicitation flow, a BM25-compacted tool catalog, and pluggable Disk/Redis
+storage for multi-worker deployments.
 
 ## Architecture
 
@@ -23,7 +27,7 @@ flowchart TB
 
     subgraph Server["gemini-research-mcp"]
         direction TB
-        FastMCP["FastMCP 3 Server<br/>@mcp.tool()"]
+        FastMCP["FastMCP 4 Server<br/>@mcp.tool()<br/>BM25SearchTransform"]
         
         subgraph Tools["Tools"]
             RW["research_web<br/>Quick lookup 5-30s"]
@@ -40,7 +44,7 @@ flowchart TB
             Quick["quick.py<br/>Web grounding"]
             Deep["deep.py<br/>Deep research agent"]
             Content["content.py<br/>SSRF protection"]
-          StorageMod["storage.py<br/>Session manager"]
+            StorageMod["storage.py<br/>Session + artifact store"]
             Templates["templates.py<br/>Format templates"]
         end
     end
@@ -51,7 +55,8 @@ flowchart TB
     end
 
     subgraph Storage["Persistence"]
-        SQLite["SQLite<br/>~/.gemini-research/"]
+        Disk["DiskStore<br/>XDG data directory"]
+        Redis["Redis/Valkey<br/>shared multi-worker storage"]
     end
 
     Claude -->|"MCP Protocol"| FastMCP
@@ -67,34 +72,46 @@ flowchart TB
     Quick -->|"grounding"| Gemini
     Deep -->|"agentic"| Gemini
     Content -->|"httpx"| Web
-    StorageMod --> SQLite
+    StorageMod --> Disk
+    StorageMod -.-> Redis
 ```
 
 </details>
 
 ## Tools
 
-### Client-Visible Tools
+The server exposes a **BM25-compacted catalog**: only the 5 tools below plus
+the synthetic `search_tools`/`call_tool` pair are listed by default
+(`fastmcp.server.transforms.search.BM25SearchTransform`). Utility tools
+(`fetch_webpage`, `research_followup`, `list_research_sessions`,
+`list_format_templates`, `refine_research_plan`,
+`inspect_mcp_server_for_gemini`) are hidden from the default
+listing to keep the catalog small for LLM tool-selection, but remain fully
+callable directly by name or via the `call_tool` proxy, and are discoverable
+by relevance through `search_tools`.
 
-| Tool | Description | Latency |
-|------|-------------|---------|
-| `research_web` | Fast web search with citations | 5-30 sec |
-| `research_deep` | Multi-step autonomous research (**requires** MCP Tasks) | 3-20 min |
-| `resume_research` | Resume or check an interrupted `research_deep` session | instant |
-| `export_research_session` | Export a session to Markdown, JSON, or DOCX (disk-first) | instant |
-| `search_tools` | BM25 search across the server's utility tools | instant |
-| `call_tool` | Invoke a utility tool discovered through `search_tools` | instant |
+| Tool | Description | Latency | Visible by default |
+|------|-------------|---------|---------------------|
+| `research_web` | Fast web search with citations | 5-30 sec | ✅ |
+| `research_deep` | Multi-step autonomous research (MCP Tasks) | 3-20 min | ✅ |
+| `research_deep_max` | Maximum-comprehensiveness Deep Research for exhaustive/high-stakes work | longer-running | ✅ |
+| `resume_research` | Resume interrupted/in-progress sessions | instant | ✅ |
+| `export_research_session` | Disk-first export to persistent Markdown, JSON, or DOCX artifacts | instant | ✅ |
+| `search_tools` | Discover hidden utility tools by relevance (BM25) | instant | ✅ |
+| `call_tool` | Proxy to invoke any hidden tool by name | varies | ✅ |
+| `research_followup` | Continue conversation after research | 5-30 sec | discoverable |
+| `list_research_sessions` | List saved research sessions | instant | discoverable |
+| `list_format_templates` | Browse report format templates | instant | discoverable |
+| `refine_research_plan` | Iterate on or approve a `collaborative_planning=True` plan | instant-3min | discoverable |
+| `fetch_webpage` | Extract article content from a specific URL (SSRF-protected, chunkable) | 0.5-2 sec | discoverable |
+| `inspect_mcp_server_for_gemini` | Diagnose remote MCP schemas and allowed tool names | varies | discoverable |
 
-### Utility Tools Available via `search_tools`
+### `research_deep` / `research_deep_max` Deep Research parameters
 
-| Tool | Description | Latency |
-|------|-------------|---------|
-| `fetch_webpage` | Extract article content from a specific URL (SSRF-protected, chunkable) | 0.5-2 sec |
-| `research_followup` | Continue conversation after research | 5-30 sec |
-| `list_research_sessions` | List saved research sessions | instant |
-| `list_format_templates` | Browse report format templates | instant |
-
-Discovered utility tools remain directly callable for clients that already know the tool name.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|--------------|
+| `visualization` | `"off"` \| `"auto"` | `"off"` | Let the agent produce and persist supporting images/charts. Images are persisted as MCP resource artifacts (`research://exports/{id}`), never inlined as text. |
+| `collaborative_planning` | boolean | `false` | Return the drafted research plan and an interaction ID instead of running the full report. Approve or iterate on the plan with `refine_research_plan(previous_interaction_id=..., decision="approve"|"iterate")`. |
 
 ### `fetch_webpage` Parameters
 
@@ -135,13 +152,17 @@ extraction and `protego`-based `robots.txt` checks are unavailable.
 
 ### Features
 
-- **Auto-Clarification**: `research_deep` asks clarifying questions for vague queries via [MCP Elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation)
+- **Auto-Clarification**: `research_deep` asks clarifying questions for vague queries. On the modern sessionless MCP protocol this uses a stateless guard pattern (`InputRequiredResult`, two independent tool calls, no server-held connection); legacy handshake clients still use [MCP Elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation) (`ctx.elicit()`)
+- **Deep Research Max**: `research_deep_max` exposes Google's Max agent for exhaustive, high-stakes, and offline research workflows
+- **Collaborative Planning**: `research_deep(..., collaborative_planning=True)` returns the drafted plan for approval before running the full report; refine or approve it with `refine_research_plan`
+- **Visualization**: `visualization="auto"` lets Deep Research produce supporting images, persisted as downloadable MCP resource artifacts
 - **MCP Tasks**: [Real-time progress](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) with streaming updates
-- **Session Persistence**: Research sessions are automatically saved and can be resumed later
-- **Export Formats**: Export to Markdown, JSON, or professional DOCX with Table of Contents
+- **Session Persistence**: Research sessions are automatically saved and can be resumed later; shareable across instances with Redis (see [Storage backends](#storage-backends))
+- **Persistent, Disk-First Exports**: Export to Markdown, JSON, or professional DOCX with Table of Contents; artifacts survive restarts and can be shared through Redis while files are still written to disk by default
 - **File Search**: Search your own data alongside web using `file_search_store_names`
-- **Remote MCP sources**: Deep Research can call remote MCP servers using `mcp_servers`
+- **Remote MCP sources**: `research_deep_max` can call remote MCP servers using `mcp_servers`
 - **Format Instructions**: Control report structure (sections, tables, tone)
+- **LangChain-ready**: verified consumable via `langchain.mcp.MCPAdapter` (LangChain `1.4.0a2`) over both stdio and streamable-http - see [`scripts/langchain_interop_smoke.py`](scripts/langchain_interop_smoke.py). LangChain is never a dependency of this package.
 
 ## Installation
 
@@ -162,17 +183,71 @@ The bundle uses UV runtime - dependencies are installed automatically, no Python
 ## Configuration
 
 | Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
+|----------|----------|---------|--------------|
 | `GEMINI_API_KEY` | **Yes** | — | [Google AI Studio API key](https://aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | No | `gemini-3.1-pro-preview` | Model for `research_web` |
-| `GEMINI_SUMMARY_MODEL` | No | `gemini-3-flash-preview` | Model for session summaries (fast) |
-| `DEEP_RESEARCH_AGENT` | No | `deep-research-pro-preview-12-2025` | Agent for `research_deep` |
+| `GEMINI_MODEL` | No | `gemini-3.7-flash` | Model for `research_web` |
+| `GEMINI_SUMMARY_MODEL` | No | `gemini-3.7-flash` | Model for session summaries, titles, and clarification (thinking level `low`) |
+| `DEEP_RESEARCH_AGENT` | No | `deep-research-preview-04-2026` | Default agent for `research_deep`; accepts `fast`, `standard`, `deep-research`, `max`, `deep-research-max`, or exact agent IDs |
 | `FETCH_PROXY_URL` | No | — | Default HTTP(S) proxy for `fetch_webpage` |
+| `GEMINI_RESEARCH_STORAGE_URL` | No | — | `redis://...` URL to share sessions/exports across multiple server instances/workers. Falls back to a local `DiskStore` when unset (see [Storage backends](#storage-backends)) |
+| `GEMINI_RESEARCH_STORAGE_PATH` | No | XDG data dir | Custom directory for the local `DiskStore` |
+| `GEMINI_RESEARCH_TTL_SECONDS` | No | backend default | Override session/export TTL |
+| `GEMINI_RESEARCH_EXPORT_DIR` | No | `~/.gemini-research/exports/` | Disk-first destination when `export_research_session` has no `output_path` |
+| `GEMINI_RESEARCH_TRANSPORT` | No | `stdio` | `stdio` (default, historical) or `streamable-http` (opt-in, see [Transports](#transports)) |
+| `GEMINI_RESEARCH_HTTP_HOST` | No | `127.0.0.1` | Bind host for `streamable-http`. Non-loopback requires `GEMINI_RESEARCH_HTTP_BEARER_TOKEN` |
+| `GEMINI_RESEARCH_HTTP_PORT` | No | `8000` | Bind port for `streamable-http` |
+| `GEMINI_RESEARCH_HTTP_PATH` | No | `/mcp` | URL path for `streamable-http` |
+| `GEMINI_RESEARCH_HTTP_BEARER_TOKEN` | No | — | Static bearer token required to call `streamable-http`. Never reuse `GEMINI_API_KEY` for this |
 
 ```bash
 cp .env.example .env
 # Edit .env with your API key
 ```
+
+## Transports
+
+The server defaults to **stdio**, matching every existing VS Code/Claude
+Desktop configuration - no changes required for local, single-client use.
+
+**Streamable HTTP** is opt-in, for remote or multi-client/multi-worker
+deployments, and is sessionless (no sticky session required across calls):
+
+```bash
+# Local-only (no auth required, loopback binding):
+uv run gemini-research-mcp --transport streamable-http
+
+# Remote-accessible (bearer token required - refuses to start otherwise):
+GEMINI_RESEARCH_HTTP_BEARER_TOKEN=$(openssl rand -hex 32) \
+  uv run gemini-research-mcp --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+Binding to any non-loopback host (`0.0.0.0`, `::`, a LAN/public IP, etc.)
+without `GEMINI_RESEARCH_HTTP_BEARER_TOKEN` set causes the server to refuse to
+start - this prevents accidentally exposing your Gemini API quota to the
+public internet. `127.0.0.1`/`localhost`/`::1` never require a token.
+
+`--transport`, `--host`, `--port`, and `--path` CLI flags mirror the
+`GEMINI_RESEARCH_TRANSPORT`/`GEMINI_RESEARCH_HTTP_HOST`/`GEMINI_RESEARCH_HTTP_PORT`/`GEMINI_RESEARCH_HTTP_PATH`
+environment variables (CLI flags take precedence).
+
+## Storage backends
+
+Research sessions and export artifacts are stored through a single
+backend-agnostic layer:
+
+- **Local (default)**: a `DiskStore` under the XDG data directory
+  (`GEMINI_RESEARCH_STORAGE_PATH` to override) - zero configuration, single
+  process/single machine.
+- **Distributed (Redis/Valkey)**: set `GEMINI_RESEARCH_STORAGE_URL=redis://host:6379/0`
+  to share sessions and exports across multiple server instances or workers -
+  a session created (or an export produced) on one instance is immediately
+  readable from another. Requires the `distributed` extra:
+
+```bash
+uv add 'gemini-research-mcp[distributed]'
+```
+
+
 
 ### Deep Research vs Deep Research Max
 
@@ -194,9 +269,19 @@ Gemini models while Deep Research uses Interactions agents.
 
 ### Remote MCP servers for Deep Research
 
-Google Deep Research supports remote MCP servers through the Interactions API. Pass
-`mcp_servers` to `research_deep` or `research_deep_max` when the agent needs a
-specialized/private data source.
+Google Deep Research exposes remote MCP server wiring through the Interactions
+API. In this package, pass `mcp_servers` to `research_deep_max` when the agent
+needs a specialized/private data source.
+
+> **Experimental:** remote MCP is gated to
+> `deep-research-max-preview-04-2026`. The standard
+> `deep-research-preview-04-2026` agent has reproduced provider-side
+> finalization/retrieval `500 api_error` failures after successful MCP tool
+> calls; use `research_deep_max` or set
+> `DEEP_RESEARCH_AGENT=deep-research-max-preview-04-2026`. See
+> <https://github.com/googleapis/python-genai/issues/2126>.
+
+Example `research_deep_max` `mcp_servers` argument:
 
 ```json
 {
@@ -220,7 +305,7 @@ specialized/private data source.
 ```
 
 Use `allowed_tools` aggressively. For evidence-led workflows, expose read-only
-ledger/report/status tools to Deep Research and import the resulting report back
+ledger/report/status tools to Deep Research Max and import the resulting report back
 through your own audit/quarantine path. The MCP server tool accepts the
 user-friendly string list shown above and normalizes it to the Gemini
 Interactions API `allowed_tools` object shape before sending the request.
@@ -232,6 +317,37 @@ descriptions, empty input schemas, unsupported JSON Schema keywords, or
 `allowed_tools` names that do not exist on the server. Public quick-tunnel hosts
 may still be rejected before Gemini contacts the server; prefer a stable HTTPS
 deployment for production E2E tests.
+
+Live E2E validation is intentionally skipped by default because it is paid,
+slow, and depends on preview APIs. There are two useful levels:
+
+1. Minimal marker smoke test: proves remote MCP result inclusion with a stable
+   HTTPS MCP fixture that returns `MCP_E2E_FIXTURE_7B9F2A` from
+   `get_guardrail_summary`.
+
+```bash
+GEMINI_API_KEY=... \
+GEMINI_MCP_E2E_URL=https://fresh-stable-fixture.example/mcp \
+uv run pytest -m e2e tests/test_deep_research_max_mcp_e2e.py -q
+```
+
+2. Realistic evidence-inclusion test: proves Deep Research Max can start a new
+   research task and integrate substantive MCP-only evidence into the final
+   report. The fixture should expose read-only tools such as
+   `market_get_mission`, `market_get_evidence_ledger`,
+   `market_get_runtime_policy`, and `market_generate_report`.
+
+```bash
+GEMINI_API_KEY=... \
+GEMINI_MCP_REALISTIC_E2E_URL=https://fresh-realistic-fixture.example/mcp \
+GEMINI_MCP_E2E_ARTIFACT_DIR=/tmp/gemini-realistic-e2e \
+uv run pytest -m e2e tests/test_deep_research_max_mcp_e2e.py \
+  -q -s -k realistic_evidence_inclusion
+```
+
+The realistic test checks for multiple MCP-only evidence IDs, distinctive
+metrics, platform constraints, a derived gate recommendation, and absence of the
+hidden/disallowed tool canary.
 
 ## Usage
 
@@ -330,8 +446,8 @@ temp dir if that location isn't writable). Override per-call with the
 
 When `output_path` is supplied, the parent directory must already
 exist (no silent `mkdir`). GUI hosts (e.g. VS Code Copilot Chat) also
-receive an `EmbeddedResource` attachment for native "Save As" —
-clients that can't render it can safely ignore it.
+receive an `EmbeddedResource` attachment backed by the persistent
+`research://exports/{id}` resource store for native "Save As" — clients that can't render it can safely ignore it.
 
 ### Client compatibility
 

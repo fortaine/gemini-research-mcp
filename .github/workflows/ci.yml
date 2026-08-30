@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      - name: Run linter
+        run: uv run ruff check src/ tests/
+
+      - name: Run type checker (strict)
+        run: uv run mypy src/
+
+      - name: Run unit tests
+        run: uv run pytest -v --tb=short
+
+      - name: Run unit tests (FastMCP camelCase compat shim disabled)
+        run: FASTMCP_MCP_CAMELCASE_COMPAT=false uv run pytest -v --tb=short
+
+  redis-sharing:
+    name: redis distributed storage (opt-in)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (with distributed extra)
+        run: uv sync --extra dev --extra distributed
+
+      - name: Run live Redis cross-instance sharing tests
+        env:
+          GEMINI_RESEARCH_REDIS_TEST_URL: redis://localhost:6379/0
+        run: uv run pytest -m redis tests/test_storage_redis_live.py -v --tb=short
+
+  build:
+    name: build wheel/sdist + MCPB bundle
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for hatch-vcs to read git tags
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Build wheel/sdist
+        run: uv build
+
+      - name: Verify built artifacts do not leak secrets or local caches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          forbidden_pattern='\.env$|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.DS_Store'
+          for archive in dist/*.whl dist/*.tar.gz; do
+            echo "Inspecting ${archive}"
+            if [[ "$archive" == *.whl ]]; then
+              listing=$(python -m zipfile -l "$archive")
+            else
+              listing=$(tar -tzf "$archive")
+            fi
+            if echo "$listing" | grep -E -i "$forbidden_pattern"; then
+              echo "::error::${archive} contains a forbidden file (secret or local cache artifact)"
+              exit 1
+            fi
+          done
+          echo "No forbidden files found in built artifacts."
+
+      - name: Install mcpb CLI
+        run: npm install -g @anthropic-ai/mcpb
+
+      - name: Build MCPB bundle
+        run: mcpb pack . gemini-research-mcp.mcpb
+
+      - name: Verify MCPB bundle does not leak secrets or local caches
+        run: |
+          set -euo pipefail
+          forbidden_pattern='\.env$|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.DS_Store'
+          if python -m zipfile -l gemini-research-mcp.mcpb | grep -E -i "$forbidden_pattern"; then
+            echo "::error::gemini-research-mcp.mcpb contains a forbidden file (secret or local cache artifact)"
+            exit 1
+          fi
+          echo "No forbidden files found in the MCPB bundle."
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Upload MCPB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcpb
+          path: gemini-research-mcp.mcpb

@@ -10,7 +10,9 @@ from gemini_research_mcp.deep import (
     analyze_mcp_tool_for_gemini,
     build_interactions_tools,
     deep_research_stream,
+    validate_mcp_servers_supported,
 )
+from gemini_research_mcp.types import DeepResearchAgent
 
 
 def test_build_interactions_tools_combines_file_search_and_mcp() -> None:
@@ -183,6 +185,40 @@ def test_build_interactions_tools_validates_allowed_tools() -> None:
         )
 
 
+def test_validate_mcp_servers_supported_rejects_standard_deep_research() -> None:
+    with pytest.raises(ValueError, match="Deep Research Max"):
+        validate_mcp_servers_supported(
+            agent_name=DeepResearchAgent.DEEP_RESEARCH,
+            mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
+        )
+
+
+def test_validate_mcp_servers_supported_accepts_deep_research_max() -> None:
+    validate_mcp_servers_supported(
+        agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
+        mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
+    )
+
+
+def test_validate_mcp_servers_supported_accepts_standard_without_mcp() -> None:
+    validate_mcp_servers_supported(
+        agent_name=DeepResearchAgent.DEEP_RESEARCH,
+        mcp_servers=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_deep_research_stream_rejects_mcp_on_standard_agent() -> None:
+    stream = deep_research_stream(
+        query="Use my MCP tool",
+        agent_name=DeepResearchAgent.DEEP_RESEARCH,
+        mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
+    )
+
+    with pytest.raises(ValueError, match="Deep Research Max"):
+        await anext(stream)
+
+
 def test_analyze_mcp_tool_for_gemini_accepts_simple_described_schema() -> None:
     issues = analyze_mcp_tool_for_gemini({
         "name": "get_guardrail_summary",
@@ -272,6 +308,7 @@ async def test_deep_research_stream_passes_mcp_servers_to_interactions(
         event
         async for event in deep_research_stream(
             "Use the fixture MCP server.",
+            agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
             mcp_servers=[
                 {
                     "name": "Fixture MCP",
@@ -283,6 +320,7 @@ async def test_deep_research_stream_passes_mcp_servers_to_interactions(
     ]
 
     assert [event.event_type for event in events] == ["start", "complete"]
+    assert captured["agent"] == DeepResearchAgent.DEEP_RESEARCH_MAX.value
     assert captured["tools"] == [
         {
             "type": "mcp_server",
