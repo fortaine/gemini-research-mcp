@@ -20,6 +20,7 @@ from gemini_research_mcp.config import (
     get_api_key,
     get_deep_research_agent,
     get_model,
+    get_tasks_backend_url,
     is_retryable_error,
 )
 from gemini_research_mcp.types import DeepResearchAgent
@@ -89,6 +90,41 @@ class TestGetModel:
         """Should return env override when set."""
         with patch.dict(os.environ, {"GEMINI_MODEL": "gemini-custom-model"}):
             assert get_model() == "gemini-custom-model"
+
+
+class TestGetTasksBackendUrl:
+    """Test local and distributed Tasks backend resolution."""
+
+    def test_local_default_returns_none(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert get_tasks_backend_url() is None
+
+    def test_reuses_shared_redis_url(self):
+        with patch.dict(
+            os.environ,
+            {"GEMINI_RESEARCH_STORAGE_URL": "redis://cache:6379/0"},
+            clear=True,
+        ):
+            assert get_tasks_backend_url() == "redis://cache:6379/0"
+
+    def test_explicit_docket_url_wins(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GEMINI_RESEARCH_STORAGE_URL": "redis://shared:6379/0",
+                "FASTMCP_DOCKET_URL": "redis://tasks:6379/1",
+            },
+            clear=True,
+        ):
+            assert get_tasks_backend_url() == "redis://tasks:6379/1"
+
+    def test_non_redis_storage_url_is_not_reused(self):
+        with patch.dict(
+            os.environ,
+            {"GEMINI_RESEARCH_STORAGE_URL": "file:///tmp/research"},
+            clear=True,
+        ):
+            assert get_tasks_backend_url() is None
 
 
 class TestGetDeepResearchAgent:

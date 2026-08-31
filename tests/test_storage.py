@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -9,6 +11,9 @@ import pytest
 
 from gemini_research_mcp.storage import (
     DEFAULT_TTL_SECONDS,
+    DISK_INDEX_FILENAME,
+    SESSIONS_COLLECTION,
+    ExportArtifactStore,
     ResearchSession,
     SessionStorage,
     get_storage_dir,
@@ -176,6 +181,62 @@ class TestSessionStorageAsync:
         assert sessions[0].interaction_id == "test-0"
 
     @pytest.mark.asyncio
+    async def test_save_creates_versioned_disk_index(
+        self, temp_storage: SessionStorage, sample_session: ResearchSession
+    ) -> None:
+        await temp_storage.save_session_async(sample_session)
+
+        index_path = temp_storage.storage_dir / DISK_INDEX_FILENAME
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        assert index["version"] == 1
+        assert sample_session.interaction_id in index["collections"]["sessions"]
+
+    @pytest.mark.asyncio
+    async def test_listing_migrates_legacy_disk_cache(self, tmp_path: Path) -> None:
+        from key_value.aio.stores.disk import DiskStore
+
+        legacy_session = ResearchSession(
+            interaction_id="legacy-v0160b1",
+            query="Legacy session",
+            created_at=time.time(),
+        )
+        legacy_store = DiskStore(directory=tmp_path)
+        await legacy_store.put(
+            legacy_session.interaction_id,
+            legacy_session.to_dict(),
+            collection=SESSIONS_COLLECTION,
+        )
+
+        storage = SessionStorage(storage_dir=tmp_path)
+        sessions = await storage.list_sessions_async()
+
+        assert [session.interaction_id for session in sessions] == [
+            legacy_session.interaction_id
+        ]
+        index = json.loads(
+            (tmp_path / DISK_INDEX_FILENAME).read_text(encoding="utf-8")
+        )
+        assert legacy_session.interaction_id in index["collections"]["sessions"]
+        await legacy_store.close()
+
+    @pytest.mark.asyncio
+    async def test_listing_rebuilds_corrupted_disk_index(
+        self, temp_storage: SessionStorage, sample_session: ResearchSession
+    ) -> None:
+        await temp_storage.save_session_async(sample_session)
+        index_path = temp_storage.storage_dir / DISK_INDEX_FILENAME
+        index_path.write_text("{not-json", encoding="utf-8")
+
+        storage = SessionStorage(storage_dir=temp_storage.storage_dir)
+        sessions = await storage.list_sessions_async()
+
+        assert [session.interaction_id for session in sessions] == [
+            sample_session.interaction_id
+        ]
+        rebuilt = json.loads(index_path.read_text(encoding="utf-8"))
+        assert rebuilt["version"] == 1
+
+    @pytest.mark.asyncio
     async def test_list_sessions_with_limit(
         self, temp_storage: SessionStorage
     ) -> None:
@@ -222,6 +283,13 @@ class TestSessionStorageAsync:
         """Test that listing sessions skips corrupted entries gracefully."""
         # Save a valid session
         await temp_storage.save_session_async(sample_session)
+        await temp_storage.save_session_async(
+            ResearchSession(
+                interaction_id="corrupted-123",
+                query="Will be corrupted",
+                created_at=time.time(),
+            )
+        )
 
         # Manually write a corrupted entry (missing required 'query' field)
         corrupted_data = {"interaction_id": "corrupted-123", "created_at": 12345.0}
@@ -523,3 +591,63 @@ class TestCrossInstanceSharing:
         refreshed = await storage_a.get_session_async(sample_session.interaction_id)
         assert refreshed is not None
         assert refreshed.notes == "from B"
+
+
+class TestExportArtifactIndex:
+    """Verify local export enumeration uses the project-owned disk index."""
+
+    @pytest.mark.asyncio
+    async def test_export_listing_survives_store_recreation(self, tmp_path: Path) -> None:
+        store_a = ExportArtifactStore(storage_dir=tmp_path)
+        export_id = await store_a.save_async(
+            session_id="session-1",
+            filename="report.md",
+            format="markdown",
+            mime_type="text/markdown",
+            content=b"report",
+        )
+
+        store_b = ExportArtifactStore(storage_dir=tmp_path)
+        exports = await store_b.list_async()
+
+        assert [artifact.export_id for artifact in exports] == [export_id]
+        index = json.loads(
+            (tmp_path / DISK_INDEX_FILENAME).read_text(encoding="utf-8")
+        )
+        assert export_id in index["collections"]["exports"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_session_and_export_updates_share_index(
+        self, tmp_path: Path
+    ) -> None:
+        session_storage = SessionStorage(storage_dir=tmp_path)
+        export_storage = ExportArtifactStore(storage_dir=tmp_path)
+
+        async def save_session(index: int) -> None:
+            await session_storage.save_session_async(
+                ResearchSession(
+                    interaction_id=f"session-{index}",
+                    query=f"Query {index}",
+                    created_at=time.time(),
+                )
+            )
+
+        async def save_export(index: int) -> None:
+            await export_storage.save_async(
+                session_id=f"session-{index}",
+                filename=f"report-{index}.md",
+                format="markdown",
+                mime_type="text/markdown",
+                content=f"report {index}".encode(),
+            )
+
+        await asyncio.gather(
+            *(save_session(index) for index in range(10)),
+            *(save_export(index) for index in range(10)),
+        )
+
+        index = json.loads(
+            (tmp_path / DISK_INDEX_FILENAME).read_text(encoding="utf-8")
+        )
+        assert len(index["collections"]["sessions"]) == 10
+        assert len(index["collections"]["exports"]) == 10

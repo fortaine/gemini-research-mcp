@@ -50,6 +50,7 @@ from gemini_research_mcp.config import (
     get_deep_research_agent,
     get_export_dir,
     get_model,
+    get_tasks_backend_url,
     is_retryable_error,
 )
 from gemini_research_mcp.content import fetch_webpage as _fetch_webpage
@@ -89,7 +90,12 @@ from gemini_research_mcp.storage import (
 from gemini_research_mcp.storage import (
     list_research_sessions as _list_sessions,
 )
-from gemini_research_mcp.types import DeepResearchAgent, DeepResearchError, DeepResearchResult
+from gemini_research_mcp.types import (
+    DeepResearchAgent,
+    DeepResearchError,
+    DeepResearchResult,
+    ErrorCategory,
+)
 
 # Configure logging
 logger = logging.getLogger(LOGGER_NAME)
@@ -225,8 +231,11 @@ Clients that already know a hidden tool name can still call it directly.
 
 # FastMCP 4 no longer wires the Docket task backend implicitly: TaskConfig-enabled
 # tools require the SEP-2663 tasks extension to be registered explicitly.
-# FASTMCP_DOCKET_URL (unchanged from FastMCP 3) still configures the backend.
-mcp.add_extension(TasksExtension())
+# FASTMCP_DOCKET_URL explicitly configures the backend. Otherwise a configured
+# shared Redis storage URL is reused; None preserves the local memory default.
+mcp.add_extension(
+    TasksExtension(url=get_tasks_backend_url(), name="gemini-research-mcp")
+)
 
 # Keep the visible tool catalog compact via BM25 relevance search. The five
 # tools most clients need immediately stay always-visible in list_tools();
@@ -833,7 +842,7 @@ async def _run_deep_research_tool(
             automatic).
         format_instructions: Optional report structure/tone guidance
         file_search_store_names: Optional file stores for RAG over your own data
-        mcp_servers: Optional remote MCP servers for custom/private data and tools
+        mcp_servers: Disabled compatibility parameter; non-empty values are rejected
         visualization: "off" (default) or "auto" - allow the agent to include
             chart/diagram images in its response
         collaborative_planning: When True, return the drafted research plan (not
@@ -845,25 +854,24 @@ async def _run_deep_research_tool(
         collaborative_planning=True) the drafted plan awaiting approval.
     """
     logger.info("🔬 %s (%s): %s", tool_name, agent_name.value, query[:100])
+    try:
+        validate_mcp_servers_supported(agent_name=agent_name, mcp_servers=mcp_servers)
+    except ValueError as exc:
+        raise DeepResearchError(
+            "REMOTE_MCP_DISABLED",
+            str(exc),
+            details={
+                "feature": "deep_research_remote_mcp",
+                "diagnostic_tool": "inspect_mcp_server_for_gemini",
+                "upstream_issue": "https://github.com/googleapis/python-genai/issues/2126",
+            },
+            category=ErrorCategory.UNSUPPORTED_FEATURE,
+        ) from exc
+
     if format_instructions:
         logger.info("   📝 Format: %s", format_instructions[:80])
     if file_search_store_names:
         logger.info("   📁 File search stores: %s", file_search_store_names)
-    if mcp_servers:
-        names = [
-            str(server.get("name") or server.get("url") or "unnamed")
-            for server in mcp_servers
-        ]
-        logger.info("   🔌 MCP servers: %s", names)
-        try:
-            validate_mcp_servers_supported(agent_name=agent_name, mcp_servers=mcp_servers)
-        except ValueError as exc:
-            raise DeepResearchError("INVALID_REQUEST", str(exc)) from exc
-        logger.warning(
-            "   ⚠️ Remote MCP for Deep Research is experimental and currently gated to "
-            "Deep Research Max. Validate each endpoint with a marker result-inclusion "
-            "probe before relying on the output."
-        )
 
     # Resolve template key to full template instructions
     effective_format = format_instructions
@@ -1238,11 +1246,11 @@ async def inspect_mcp_server_for_gemini(
     ] = None,
 ) -> str:
     """
-    Inspect a remote MCP server before passing it to Gemini Deep Research.
+    Inspect a remote MCP server's reachability and tool schemas.
 
-    This is a diagnostics/preflight helper for provider-side 400s. It lists
-    remote tools through MCP and flags metadata patterns that often make Gemini
-    reject `type=mcp_server` before the research task starts.
+    This standalone diagnostic lists remote tools and flags schema patterns
+    relevant to Gemini compatibility. It does not enable remote MCP in Deep
+    Research; that provider integration is currently disabled as unreliable.
     """
     result = await _inspect_mcp_server_for_gemini({
         "name": name,
@@ -1270,10 +1278,8 @@ async def research_deep(
     mcp_servers: Annotated[
         list[dict[str, object]] | None,
         (
-            "Optional remote MCP server configs for Deep Research. Each item may include "
-            "name, url, headers, and allowed_tools. Remote MCP requires Deep Research "
-            "Max; use research_deep_max or set DEEP_RESEARCH_AGENT to "
-            "deep-research-max-preview-04-2026."
+            "Disabled: remote MCP is currently unreliable for Deep Research. "
+            "Any non-empty value fails before network or Gemini API access."
         ),
     ] = None,
     visualization: Annotated[
@@ -1332,9 +1338,8 @@ async def research_deep_max(
     mcp_servers: Annotated[
         list[dict[str, object]] | None,
         (
-            "Optional remote MCP server configs for Deep Research Max. Each item may "
-            "include name, url, headers, and allowed_tools. This is the supported "
-            "remote-MCP path for result-inclusion validation."
+            "Disabled: remote MCP is currently unreliable for Deep Research Max. "
+            "Any non-empty value fails before network or Gemini API access."
         ),
     ] = None,
     visualization: Annotated[

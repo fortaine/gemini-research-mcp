@@ -10,7 +10,7 @@ MCP server for AI-powered research using **Gemini**. Fast grounded search, URL e
 Built on **FastMCP `4.0.0b5`** (beta, exact-pinned) with the modern sessionless
 MCP protocol, **Gemini `3.7 Flash`**, MCP Tasks (SEP-1732), the guard-pattern
 elicitation flow, a BM25-compacted tool catalog, and pluggable Disk/Redis
-storage for multi-worker deployments.
+storage with a zero-configuration local default.
 
 ## Architecture
 
@@ -104,7 +104,7 @@ by relevance through `search_tools`.
 | `list_format_templates` | Browse report format templates | instant | discoverable |
 | `refine_research_plan` | Iterate on or approve a `collaborative_planning=True` plan | instant-3min | discoverable |
 | `fetch_webpage` | Extract article content from a specific URL (SSRF-protected, chunkable) | 0.5-2 sec | discoverable |
-| `inspect_mcp_server_for_gemini` | Diagnose remote MCP schemas and allowed tool names | varies | discoverable |
+| `inspect_mcp_server_for_gemini` | Inspect remote MCP reachability and schemas (diagnostic only) | varies | discoverable |
 
 ### `research_deep` / `research_deep_max` Deep Research parameters
 
@@ -112,6 +112,7 @@ by relevance through `search_tools`.
 |-----------|------|---------|--------------|
 | `visualization` | `"off"` \| `"auto"` | `"off"` | Let the agent produce and persist supporting images/charts. Images are persisted as MCP resource artifacts (`research://exports/{id}`), never inlined as text. |
 | `collaborative_planning` | boolean | `false` | Return the drafted research plan and an interaction ID instead of running the full report. Approve or iterate on the plan with `refine_research_plan(previous_interaction_id=..., decision="approve"|"iterate")`. |
+| `mcp_servers` | array \| null | `null` | **Disabled.** Any non-empty value fails before network or Gemini API access because provider-side Deep Research remote MCP is not reliable. |
 
 ### `fetch_webpage` Parameters
 
@@ -160,7 +161,7 @@ extraction and `protego`-based `robots.txt` checks are unavailable.
 - **Session Persistence**: Research sessions are automatically saved and can be resumed later; shareable across instances with Redis (see [Storage backends](#storage-backends))
 - **Persistent, Disk-First Exports**: Export to Markdown, JSON, or professional DOCX with Table of Contents; artifacts survive restarts and can be shared through Redis while files are still written to disk by default
 - **File Search**: Search your own data alongside web using `file_search_store_names`
-- **Remote MCP sources**: `research_deep_max` can call remote MCP servers using `mcp_servers`
+- **Fail-closed remote MCP**: Deep Research rejects `mcp_servers` before network/provider access until Google exposes a reliable structured result contract
 - **Format Instructions**: Control report structure (sections, tables, tone)
 - **LangChain-ready**: verified consumable via `langchain.mcp.MCPAdapter` (LangChain `1.4.0a2`) over both stdio and streamable-http - see [`scripts/langchain_interop_smoke.py`](scripts/langchain_interop_smoke.py). LangChain is never a dependency of this package.
 
@@ -189,7 +190,8 @@ The bundle uses UV runtime - dependencies are installed automatically, no Python
 | `GEMINI_SUMMARY_MODEL` | No | `gemini-3.7-flash` | Model for session summaries, titles, and clarification (thinking level `low`) |
 | `DEEP_RESEARCH_AGENT` | No | `deep-research-preview-04-2026` | Default agent for `research_deep`; accepts `fast`, `standard`, `deep-research`, `max`, `deep-research-max`, or exact agent IDs |
 | `FETCH_PROXY_URL` | No | — | Default HTTP(S) proxy for `fetch_webpage` |
-| `GEMINI_RESEARCH_STORAGE_URL` | No | — | `redis://...` URL to share sessions/exports across multiple server instances/workers. Falls back to a local `DiskStore` when unset (see [Storage backends](#storage-backends)) |
+| `GEMINI_RESEARCH_STORAGE_URL` | No | — | `redis://...` URL to share sessions, exports, and (unless overridden) Tasks across multiple instances/workers. Local DiskStore + memory Tasks remain the default |
+| `FASTMCP_DOCKET_URL` | No | — | Advanced Tasks backend override. Takes priority over `GEMINI_RESEARCH_STORAGE_URL`; unset preserves memory Tasks locally |
 | `GEMINI_RESEARCH_STORAGE_PATH` | No | XDG data dir | Custom directory for the local `DiskStore` |
 | `GEMINI_RESEARCH_TTL_SECONDS` | No | backend default | Override session/export TTL |
 | `GEMINI_RESEARCH_EXPORT_DIR` | No | `~/.gemini-research/exports/` | Disk-first destination when `export_research_session` has no `output_path` |
@@ -235,13 +237,14 @@ environment variables (CLI flags take precedence).
 Research sessions and export artifacts are stored through a single
 backend-agnostic layer:
 
-- **Local (default)**: a `DiskStore` under the XDG data directory
+- **Local (default, no Redis required)**: sessions and exports use `DiskStore`
+  under the XDG data directory, while FastMCP Tasks use in-process memory
   (`GEMINI_RESEARCH_STORAGE_PATH` to override) - zero configuration, single
   process/single machine.
 - **Distributed (Redis/Valkey)**: set `GEMINI_RESEARCH_STORAGE_URL=redis://host:6379/0`
-  to share sessions and exports across multiple server instances or workers -
-  a session created (or an export produced) on one instance is immediately
-  readable from another. Requires the `distributed` extra:
+  to share sessions, exports, and Tasks across multiple server instances or
+  workers. Set `FASTMCP_DOCKET_URL` only when Tasks must use a different
+  backend. Requires the `distributed` extra:
 
 ```bash
 uv add 'gemini-research-mcp[distributed]'
@@ -269,95 +272,23 @@ Gemini models while Deep Research uses Interactions agents.
 
 ### Remote MCP servers for Deep Research
 
-Google Deep Research exposes remote MCP server wiring through the Interactions
-API. In this package, pass `mcp_servers` to `research_deep_max` when the agent
-needs a specialized/private data source.
+**Disabled in `v0.16.0b2`.** Any non-empty `mcp_servers` value is rejected for
+both `research_deep` and `research_deep_max` before remote inspection, network
+access, or Gemini API consumption.
 
-> **Experimental:** remote MCP is gated to
-> `deep-research-max-preview-04-2026`. The standard
-> `deep-research-preview-04-2026` agent has reproduced provider-side
-> finalization/retrieval `500 api_error` failures after successful MCP tool
-> calls; use `research_deep_max` or set
-> `DEEP_RESEARCH_AGENT=deep-research-max-preview-04-2026`. See
-> <https://github.com/googleapis/python-genai/issues/2126>.
->
-> **Known limitation (live-verified):** even on `research_deep_max`, the
-> provider-side agent may call the remote MCP tool successfully (confirmed via
-> server-side access logs) yet fail to ground its final report in the
-> returned data — paraphrasing a marker token instead of quoting it verbatim,
-> or omitting specific evidence IDs/facts from a retrieved evidence ledger.
-> This is preview-API agent behavior, not a bug in this package. Treat
-> `research_deep_max` MCP evidence as best-effort: always verify citations
-> against your own audit/quarantine path before trusting a report for
-> decisions.
+The request shape is valid and Google documents MCP as a Deep Research tool,
+but repeated paid E2E runs completed without any
+`mcp_server_tool_call`/`mcp_server_tool_result` steps. One run also invented
+substitute evidence after failing to obtain the fixture data. See
+[`googleapis/python-genai#2126`](https://github.com/googleapis/python-genai/issues/2126).
 
-Example `research_deep_max` `mcp_servers` argument:
+`inspect_mcp_server_for_gemini` remains available to inspect endpoint
+reachability, tool names, and schema compatibility. It does **not** enable the
+disabled Deep Research integration.
 
-```json
-{
-  "query": "Use the Market Researcher MCP evidence ledger to analyze the approved market gate.",
-  "mcp_servers": [
-    {
-      "name": "Market Researcher MCP",
-      "url": "https://example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${TOKEN}"
-      },
-      "allowed_tools": [
-        "market_get_mission",
-        "market_get_runtime_policy",
-        "market_get_task_status",
-        "market_generate_report"
-      ]
-    }
-  ]
-}
-```
+Remote MCP will only be reconsidered after an upstream correction and repeated
+E2E runs that retain non-empty structured tool-call and tool-result steps.
 
-Use `allowed_tools` aggressively. For evidence-led workflows, expose read-only
-ledger/report/status tools to Deep Research Max and import the resulting report back
-through your own audit/quarantine path. The MCP server tool accepts the
-user-friendly string list shown above and normalizes it to the Gemini
-Interactions API `allowed_tools` object shape before sending the request.
-
-If Gemini returns a generic `400 invalid_request` before the research task
-starts, use `inspect_mcp_server_for_gemini` first. It lists the remote MCP
-server tools and flags common compatibility problems such as missing tool
-descriptions, empty input schemas, unsupported JSON Schema keywords, or
-`allowed_tools` names that do not exist on the server. Public quick-tunnel hosts
-may still be rejected before Gemini contacts the server; prefer a stable HTTPS
-deployment for production E2E tests.
-
-Live E2E validation is intentionally skipped by default because it is paid,
-slow, and depends on preview APIs. There are two useful levels:
-
-1. Minimal marker smoke test: proves remote MCP result inclusion with a stable
-   HTTPS MCP fixture that returns `MCP_E2E_FIXTURE_7B9F2A` from
-   `get_guardrail_summary`.
-
-```bash
-GEMINI_API_KEY=... \
-GEMINI_MCP_E2E_URL=https://fresh-stable-fixture.example/mcp \
-uv run pytest -m e2e tests/test_deep_research_max_mcp_e2e.py -q
-```
-
-2. Realistic evidence-inclusion test: proves Deep Research Max can start a new
-   research task and integrate substantive MCP-only evidence into the final
-   report. The fixture should expose read-only tools such as
-   `market_get_mission`, `market_get_evidence_ledger`,
-   `market_get_runtime_policy`, and `market_generate_report`.
-
-```bash
-GEMINI_API_KEY=... \
-GEMINI_MCP_REALISTIC_E2E_URL=https://fresh-realistic-fixture.example/mcp \
-GEMINI_MCP_E2E_ARTIFACT_DIR=/tmp/gemini-realistic-e2e \
-uv run pytest -m e2e tests/test_deep_research_max_mcp_e2e.py \
-  -q -s -k realistic_evidence_inclusion
-```
-
-The realistic test checks for multiple MCP-only evidence IDs, distinctive
-metrics, platform constraints, a derived gate recommendation, and absence of the
-hidden/disallowed tool canary.
 
 ## Usage
 

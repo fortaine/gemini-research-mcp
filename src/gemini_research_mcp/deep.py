@@ -61,13 +61,12 @@ _GEMINI_UNSUPPORTED_MCP_SCHEMA_KEYWORDS = frozenset({
     "patternProperties",
     "then",
 })
-_MCP_REQUIRES_MAX_MESSAGE = (
-    "Remote MCP servers are currently supported only with Deep Research Max "
-    "deep-research-max-preview-04-2026. The standard "
-    "deep-research-preview-04-2026 agent has reproduced server-side "
-    "finalization/retrieval failures after MCP tool calls. Use "
-    "research_deep_max, or set DEEP_RESEARCH_AGENT=deep-research-max-preview-04-2026, "
-    "when passing mcp_servers."
+REMOTE_MCP_DISABLED_MESSAGE = (
+    "Remote MCP is disabled for Deep Research and Deep Research Max because the "
+    "provider does not reliably execute or retain MCP tool calls and results. "
+    "Do not pass mcp_servers. You may use inspect_mcp_server_for_gemini for "
+    "standalone endpoint diagnostics. Upstream issue: "
+    "https://github.com/googleapis/python-genai/issues/2126"
 )
 
 
@@ -223,9 +222,10 @@ def validate_mcp_servers_supported(
     agent_name: DeepResearchAgent,
     mcp_servers: list[dict[str, Any]] | None,
 ) -> None:
-    """Fail fast when remote MCP is requested for an agent without result-inclusion E2E."""
-    if mcp_servers and agent_name != DeepResearchAgent.DEEP_RESEARCH_MAX:
-        raise ValueError(_MCP_REQUIRES_MAX_MESSAGE)
+    """Fail fast while provider-side Deep Research remote MCP is unreliable."""
+    del agent_name
+    if mcp_servers:
+        raise ValueError(REMOTE_MCP_DISABLED_MESSAGE)
 
 
 def build_interactions_tools(
@@ -234,14 +234,15 @@ def build_interactions_tools(
     mcp_servers: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Build Gemini Interactions API tools without logging or persisting secrets."""
+    if mcp_servers:
+        raise ValueError(REMOTE_MCP_DISABLED_MESSAGE)
+
     tools: list[dict[str, Any]] = []
     if file_search_store_names:
         tools.append({
             "type": "file_search",
             "file_search_store_names": file_search_store_names,
         })
-    for server in mcp_servers or []:
-        tools.append(_validate_mcp_server_tool(server))
     return tools or None
 
 
@@ -560,7 +561,7 @@ async def deep_research_stream(
         query: Research question or topic
         format_instructions: Optional formatting instructions for output
         file_search_store_names: Optional list of file search store names for RAG
-        mcp_servers: Optional remote MCP server tool configs for Deep Research
+        mcp_servers: Disabled compatibility parameter; non-empty values are rejected
         agent_name: Deep Research agent to use
         visualization: "off" (default) or "auto" - whether the Deep Research agent
             may include chart/diagram images in its response (agent_config.visualization).

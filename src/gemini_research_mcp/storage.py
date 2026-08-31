@@ -17,8 +17,10 @@ Gemini Interaction Retention:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Coroutine
 from dataclasses import asdict, dataclass, field
@@ -28,10 +30,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import platformdirs
+from diskcache import Cache  # type: ignore[import-untyped]
+from key_value.aio.protocols.key_value import AsyncEnumerateKeysProtocol
 from key_value.aio.stores.base import BaseStore
 from key_value.aio.stores.disk import DiskStore
 
-from gemini_research_mcp.config import LOGGER_NAME
+from gemini_research_mcp.config import LOGGER_NAME, STORAGE_URL_ENV_VAR
 from gemini_research_mcp.types import DeepResearchAgent
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -55,9 +59,13 @@ APP_NAME = "gemini-research-mcp"
 SESSIONS_COLLECTION = "sessions"
 EXPORTS_COLLECTION = "exports"
 
-# Env var pointing at a shared backend (e.g. "redis://host:6379/0"). When
-# unset, storage falls back to the local, zero-configuration disk backend.
-STORAGE_URL_ENV_VAR = "GEMINI_RESEARCH_STORAGE_URL"
+# Versioned sidecar index used only by DiskStore, which has no public keys()
+# API. Redis and other enumerable backends use their public protocol directly.
+DISK_INDEX_FILENAME = ".gemini-research-key-index-v1.json"
+DISK_INDEX_VERSION = 1
+_INDEXED_COLLECTIONS = (SESSIONS_COLLECTION, EXPORTS_COLLECTION)
+_DISK_INDEX_LOCKS: dict[Path, threading.Lock] = {}
+_DISK_INDEX_LOCKS_GUARD = threading.Lock()
 
 
 def get_storage_backend_url() -> str | None:
@@ -123,6 +131,145 @@ def get_ttl_seconds() -> int:
         except ValueError:
             logger.warning("Invalid GEMINI_RESEARCH_TTL_SECONDS: %s", custom_ttl)
     return DEFAULT_TTL_SECONDS
+
+
+class _DiskKeyIndex:
+    """Project-owned key index for the local DiskStore backend."""
+
+    def __init__(self, storage_dir: Path):
+        self.storage_dir = storage_dir
+        self.path = storage_dir / DISK_INDEX_FILENAME
+        self._lock = asyncio.Lock()
+        resolved_path = self.path.resolve()
+        with _DISK_INDEX_LOCKS_GUARD:
+            self._file_lock = _DISK_INDEX_LOCKS.setdefault(
+                resolved_path, threading.Lock()
+            )
+
+    @staticmethod
+    def _empty() -> dict[str, Any]:
+        return {
+            "version": DISK_INDEX_VERSION,
+            "collections": {collection: [] for collection in _INDEXED_COLLECTIONS},
+        }
+
+    def _validate(self, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict) or data.get("version") != DISK_INDEX_VERSION:
+            raise ValueError("unsupported disk index version")
+
+        collections = data.get("collections")
+        if not isinstance(collections, dict):
+            raise ValueError("disk index collections must be an object")
+
+        normalized = self._empty()
+        for collection in _INDEXED_COLLECTIONS:
+            keys = collections.get(collection, [])
+            if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+                raise ValueError(f"disk index collection {collection!r} is invalid")
+            normalized["collections"][collection] = sorted(set(keys))
+        return normalized
+
+    def _scan_cache(self) -> dict[str, Any]:
+        data = self._empty()
+        cache = Cache(directory=str(self.storage_dir), eviction_policy="none")
+        try:
+            for raw_key in cache.iterkeys():
+                if not isinstance(raw_key, str) or cache.get(raw_key) is None:
+                    continue
+                for collection in _INDEXED_COLLECTIONS:
+                    prefix = f"{collection}::"
+                    if raw_key.startswith(prefix):
+                        data["collections"][collection].append(raw_key[len(prefix):])
+                        break
+        finally:
+            cache.close()
+
+        for collection in _INDEXED_COLLECTIONS:
+            data["collections"][collection] = sorted(
+                set(data["collections"][collection])
+            )
+        return data
+
+    def _write(self, data: dict[str, Any]) -> None:
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        temp_path = self.path.with_name(
+            f"{self.path.name}.{os.getpid()}.{id(self)}.tmp"
+        )
+        try:
+            temp_path.write_text(
+                json.dumps(data, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temp_path, self.path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _load_or_rebuild(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            return self._validate(raw)
+        except FileNotFoundError:
+            logger.info("Building local storage key index at %s", self.path)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("Rebuilding invalid local storage key index: %s", exc)
+
+        data = self._scan_cache()
+        self._write(data)
+        return data
+
+    def _keys_sync(self, collection: str) -> list[str]:
+        with self._file_lock:
+            data = self._load_or_rebuild()
+            return list(data["collections"][collection])
+
+    def _add_sync(self, collection: str, key: str) -> None:
+        with self._file_lock:
+            data = self._load_or_rebuild()
+            keys = set(data["collections"][collection])
+            keys.add(key)
+            data["collections"][collection] = sorted(keys)
+            self._write(data)
+
+    def _discard_many_sync(
+        self, collection: str, keys_to_remove: list[str]
+    ) -> None:
+        with self._file_lock:
+            data = self._load_or_rebuild()
+            keys = set(data["collections"][collection])
+            keys.difference_update(keys_to_remove)
+            data["collections"][collection] = sorted(keys)
+            self._write(data)
+
+    async def keys(self, collection: str) -> list[str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._keys_sync, collection)
+
+    async def add(self, collection: str, key: str) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._add_sync, collection, key)
+
+    async def discard_many(self, collection: str, keys_to_remove: list[str]) -> None:
+        if not keys_to_remove:
+            return
+        async with self._lock:
+            await asyncio.to_thread(
+                self._discard_many_sync, collection, keys_to_remove
+            )
+
+
+async def _enumerate_collection_keys(
+    store: BaseStore,
+    *,
+    collection: str,
+    disk_index: _DiskKeyIndex | None,
+) -> list[str]:
+    if isinstance(store, AsyncEnumerateKeysProtocol):
+        return await store.keys(collection=collection)
+    if disk_index is not None:
+        return await disk_index.keys(collection)
+    raise RuntimeError(
+        f"Storage backend {type(store).__name__} does not support key enumeration."
+    )
 
 
 # =============================================================================
@@ -298,6 +445,9 @@ class SessionStorage:
         """Initialize storage, using a shared backend if GEMINI_RESEARCH_STORAGE_URL is set."""
         self.storage_dir = storage_dir or get_storage_dir()
         self._store = create_store(storage_dir=self.storage_dir)
+        self._disk_index = (
+            _DiskKeyIndex(self.storage_dir) if isinstance(self._store, DiskStore) else None
+        )
         logger.debug("💾 Storage initialized at %s", self.storage_dir)
 
     # -------------------------------------------------------------------------
@@ -305,40 +455,12 @@ class SessionStorage:
     # -------------------------------------------------------------------------
 
     async def _iter_session_keys_async(self) -> list[str]:
-        """
-        Enumerate all session keys, preferring the backend's public API.
-
-        RedisStore (and any future backend) exposes a public async `keys()`
-        method, which is used directly - this is what makes session
-        enumeration work identically whether sessions live on local disk or
-        in a shared Redis instance.
-
-        DiskStore does not expose a public enumeration method, so as a
-        best-effort fallback we still reach into diskcache's native
-        `iterkeys()` for that backend only. This keeps the private-attribute
-        access isolated to the one backend that requires it, instead of
-        being load-bearing for every backend.
-        """
-        keys_method = getattr(self._store, "keys", None)
-        if callable(keys_method):
-            result: list[str] = await keys_method(collection=SESSIONS_COLLECTION)
-            return result
-
-        cache = getattr(self._store, "_cache", None)
-        if cache is None:
-            logger.warning(
-                "Storage backend %s exposes neither keys() nor a diskcache "
-                "fallback; session listing will be empty.",
-                type(self._store).__name__,
-            )
-            return []
-
-        prefix = f"{SESSIONS_COLLECTION}::"
-        return [
-            raw_key[len(prefix):]
-            for raw_key in cache.iterkeys()
-            if isinstance(raw_key, str) and raw_key.startswith(prefix)
-        ]
+        """Enumerate session keys through a public backend API or local index."""
+        return await _enumerate_collection_keys(
+            self._store,
+            collection=SESSIONS_COLLECTION,
+            disk_index=self._disk_index,
+        )
 
     # -------------------------------------------------------------------------
     # Async Core Operations
@@ -357,6 +479,8 @@ class SessionStorage:
             ttl=ttl,
             collection=SESSIONS_COLLECTION,
         )
+        if self._disk_index is not None:
+            await self._disk_index.add(SESSIONS_COLLECTION, session.interaction_id)
         logger.info(
             "💾 Saved session: %s (expires: %s)",
             session.interaction_id[:16],
@@ -374,6 +498,10 @@ class SessionStorage:
         if session.is_expired:
             logger.debug("Session %s has expired", interaction_id[:16])
             await self._store.delete(interaction_id, collection=SESSIONS_COLLECTION)
+            if self._disk_index is not None:
+                await self._disk_index.discard_many(
+                    SESSIONS_COLLECTION, [interaction_id]
+                )
             return None
         return session
 
@@ -397,9 +525,11 @@ class SessionStorage:
         """
         sessions: list[ResearchSession] = []
 
+        stale_ids: list[str] = []
         for interaction_id in await self._iter_session_keys_async():
             data = await self._store.get(interaction_id, collection=SESSIONS_COLLECTION)
             if data is None:
+                stale_ids.append(interaction_id)
                 continue
 
             try:
@@ -409,12 +539,19 @@ class SessionStorage:
                 continue
 
             if not include_expired and session.is_expired:
+                await self._store.delete(
+                    interaction_id, collection=SESSIONS_COLLECTION
+                )
+                stale_ids.append(interaction_id)
                 continue
 
             if tags and not any(tag in session.tags for tag in tags):
                 continue
 
             sessions.append(session)
+
+        if self._disk_index is not None:
+            await self._disk_index.discard_many(SESSIONS_COLLECTION, stale_ids)
 
         # Sort by created_at, newest first
         sessions.sort(key=lambda s: s.created_at, reverse=True)
@@ -431,6 +568,8 @@ class SessionStorage:
         if exists is None:
             return False
         await self._store.delete(interaction_id, collection=SESSIONS_COLLECTION)
+        if self._disk_index is not None:
+            await self._disk_index.discard_many(SESSIONS_COLLECTION, [interaction_id])
         logger.info("🗑️ Deleted session: %s", interaction_id[:16])
         return True
 
@@ -481,11 +620,12 @@ class SessionStorage:
     async def cleanup_expired_async(self) -> int:
         """Remove all expired sessions (async). Returns count of removed sessions."""
         expired_ids: list[str] = []
+        stale_ids: list[str] = []
 
         for interaction_id in await self._iter_session_keys_async():
             data = await self._store.get(interaction_id, collection=SESSIONS_COLLECTION)
             if data is None:
-                # Already expired/removed by TTL
+                stale_ids.append(interaction_id)
                 continue
             session = ResearchSession.from_dict(data)
             if session.is_expired:
@@ -493,6 +633,10 @@ class SessionStorage:
 
         for interaction_id in expired_ids:
             await self._store.delete(interaction_id, collection=SESSIONS_COLLECTION)
+        if self._disk_index is not None:
+            await self._disk_index.discard_many(
+                SESSIONS_COLLECTION, expired_ids + stale_ids
+            )
 
         if expired_ids:
             logger.info("🧹 Cleaned up %d expired sessions", len(expired_ids))
@@ -827,6 +971,9 @@ class ExportArtifactStore:
         self.storage_dir = storage_dir or get_storage_dir()
         self.ttl_seconds = ttl_seconds
         self._store = create_store(storage_dir=self.storage_dir)
+        self._disk_index = (
+            _DiskKeyIndex(self.storage_dir) if isinstance(self._store, DiskStore) else None
+        )
 
     async def save_async(
         self,
@@ -857,6 +1004,8 @@ class ExportArtifactStore:
             ttl=self.ttl_seconds,
             collection=EXPORTS_COLLECTION,
         )
+        if self._disk_index is not None:
+            await self._disk_index.add(EXPORTS_COLLECTION, export_id)
         return export_id
 
     async def get_async(self, export_id: str) -> ExportArtifact | None:
@@ -868,25 +1017,23 @@ class ExportArtifactStore:
 
     async def list_async(self) -> list[ExportArtifact]:
         """List all currently live (non-expired) exports, newest first."""
-        keys_method = getattr(self._store, "keys", None)
-        if callable(keys_method):
-            export_ids: list[str] = await keys_method(collection=EXPORTS_COLLECTION)
-        else:
-            cache = getattr(self._store, "_cache", None)
-            if cache is None:
-                return []
-            prefix = f"{EXPORTS_COLLECTION}::"
-            export_ids = [
-                raw_key[len(prefix):]
-                for raw_key in cache.iterkeys()
-                if isinstance(raw_key, str) and raw_key.startswith(prefix)
-            ]
+        export_ids = await _enumerate_collection_keys(
+            self._store,
+            collection=EXPORTS_COLLECTION,
+            disk_index=self._disk_index,
+        )
 
         artifacts: list[ExportArtifact] = []
+        stale_ids: list[str] = []
         for export_id in export_ids:
             artifact = await self.get_async(export_id)
             if artifact is not None:
                 artifacts.append(artifact)
+            else:
+                stale_ids.append(export_id)
+
+        if self._disk_index is not None:
+            await self._disk_index.discard_many(EXPORTS_COLLECTION, stale_ids)
 
         artifacts.sort(key=lambda a: a.created_at, reverse=True)
         return artifacts
