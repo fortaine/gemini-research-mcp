@@ -169,6 +169,7 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="Gemini Research",
+    version=__version__,
     icons=[Icon(src=GEMINI_ICON_URL, mime_type="image/png")],
     instructions="""
 Gemini Research MCP Server - AI-powered research toolkit
