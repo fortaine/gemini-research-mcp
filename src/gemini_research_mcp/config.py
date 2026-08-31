@@ -10,6 +10,7 @@ import os
 import tempfile
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from gemini_research_mcp.types import DeepResearchAgent
 
@@ -18,6 +19,11 @@ from gemini_research_mcp.types import DeepResearchAgent
 # =============================================================================
 
 LOGGER_NAME = "gemini-research-mcp"
+
+# Distributed backends. Local defaults remain DiskStore for application data
+# and FastMCP's memory backend for Tasks.
+STORAGE_URL_ENV_VAR = "GEMINI_RESEARCH_STORAGE_URL"
+DOCKET_URL_ENV_VAR = "FASTMCP_DOCKET_URL"
 
 
 # =============================================================================
@@ -129,6 +135,24 @@ def get_deep_research_agent() -> DeepResearchAgent:
 def get_summary_model() -> str:
     """Get model for generating summaries (fast, cheap)."""
     return os.environ.get("GEMINI_SUMMARY_MODEL", DEFAULT_SUMMARY_MODEL)
+
+
+def get_tasks_backend_url() -> str | None:
+    """Resolve the Tasks backend without mutating process-wide environment.
+
+    An explicit FASTMCP_DOCKET_URL always wins. Otherwise a configured
+    Redis-compatible application storage URL is reused so one URL can share
+    sessions, exports, and Tasks across workers. With neither value, returning
+    None preserves FastMCP's local memory default.
+    """
+    explicit = os.environ.get(DOCKET_URL_ENV_VAR)
+    if explicit:
+        return explicit
+
+    shared = os.environ.get(STORAGE_URL_ENV_VAR)
+    if shared and urlsplit(shared).scheme.lower() in {"redis", "rediss"}:
+        return shared
+    return None
 
 
 # =============================================================================

@@ -24,6 +24,7 @@ class ErrorCategory(StrEnum):
     NOT_FOUND = "NOT_FOUND"  # Interaction ID not found
     RESEARCH_FAILED = "RESEARCH_FAILED"  # Research task failed
     RESEARCH_CANCELLED = "RESEARCH_CANCELLED"  # Research was cancelled
+    UNSUPPORTED_FEATURE = "UNSUPPORTED_FEATURE"  # Feature disabled or unavailable
     INTERNAL_ERROR = "INTERNAL_ERROR"  # Unexpected internal error
     API_ERROR = "API_ERROR"  # Other API errors
 

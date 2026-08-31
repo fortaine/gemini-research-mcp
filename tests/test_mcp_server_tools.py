@@ -7,15 +7,16 @@ from gemini_research_mcp import deep
 from gemini_research_mcp.deep import (
     _extract_text_from_interaction,
     _extract_usage,
+    _validate_mcp_server_tool,
     analyze_mcp_tool_for_gemini,
     build_interactions_tools,
     deep_research_stream,
     validate_mcp_servers_supported,
 )
-from gemini_research_mcp.types import DeepResearchAgent
+from gemini_research_mcp.types import DeepResearchAgent, DeepResearchError, ErrorCategory
 
 
-def test_build_interactions_tools_combines_file_search_and_mcp() -> None:
+def _legacy_build_interactions_tools_combines_file_search_and_mcp() -> None:
     tools = build_interactions_tools(
         file_search_store_names=["fileSearchStores/market"],
         mcp_servers=[
@@ -41,6 +42,24 @@ def test_build_interactions_tools_combines_file_search_and_mcp() -> None:
             "allowed_tools": [{"tools": ["market_get_mission", "market_generate_report"]}],
         },
     ]
+
+
+def test_build_interactions_tools_supports_file_search_without_mcp() -> None:
+    assert build_interactions_tools(
+        file_search_store_names=["fileSearchStores/market"],
+    ) == [
+        {
+            "type": "file_search",
+            "file_search_store_names": ["fileSearchStores/market"],
+        }
+    ]
+
+
+def test_build_interactions_tools_rejects_remote_mcp() -> None:
+    with pytest.raises(ValueError, match="Remote MCP is disabled"):
+        build_interactions_tools(
+            mcp_servers=[{"url": "https://mcp.example.com/mcp"}]
+        )
 
 
 def test_extract_text_from_interaction_steps_model_output() -> None:
@@ -143,61 +162,61 @@ def test_extract_usage_supports_interactions_usage_fields() -> None:
     assert usage.total_tokens == 33
 
 
-def test_build_interactions_tools_rejects_non_https_remote_mcp() -> None:
+def test_validate_mcp_server_tool_rejects_non_https_remote_mcp() -> None:
     with pytest.raises(ValueError, match="must be HTTPS"):
-        build_interactions_tools(mcp_servers=[{"url": "http://mcp.example.com/mcp"}])
+        _validate_mcp_server_tool({"url": "http://mcp.example.com/mcp"})
 
 
-def test_build_interactions_tools_rejects_missing_mcp_url() -> None:
+def test_validate_mcp_server_tool_rejects_missing_mcp_url() -> None:
     with pytest.raises(ValueError, match="non-empty 'url'"):
-        build_interactions_tools(mcp_servers=[{"name": "Missing URL"}])
+        _validate_mcp_server_tool({"name": "Missing URL"})
 
 
-def test_build_interactions_tools_allows_explicit_localhost_dev_override() -> None:
-    tools = build_interactions_tools(
-        mcp_servers=[{"url": "http://127.0.0.1:8000/mcp", "allow_insecure_localhost": True}]
+def test_validate_mcp_server_tool_allows_explicit_localhost_dev_override() -> None:
+    tool = _validate_mcp_server_tool(
+        {"url": "http://127.0.0.1:8000/mcp", "allow_insecure_localhost": True}
     )
 
-    assert tools == [{"type": "mcp_server", "url": "http://127.0.0.1:8000/mcp"}]
+    assert tool == {"type": "mcp_server", "url": "http://127.0.0.1:8000/mcp"}
 
 
-def test_build_interactions_tools_validates_mcp_name() -> None:
+def test_validate_mcp_server_tool_validates_mcp_name() -> None:
     with pytest.raises(ValueError, match="name"):
-        build_interactions_tools(mcp_servers=[{"name": "", "url": "https://mcp.example.com/mcp"}])
+        _validate_mcp_server_tool(
+            {"name": "", "url": "https://mcp.example.com/mcp"}
+        )
 
 
-def test_build_interactions_tools_validates_headers() -> None:
+def test_validate_mcp_server_tool_validates_headers() -> None:
     with pytest.raises(ValueError, match="headers"):
-        build_interactions_tools(
-            mcp_servers=[
-                {
-                    "url": "https://mcp.example.com/mcp",
-                    "headers": {"Authorization": 123},
-                }
-            ]
-        )
+        _validate_mcp_server_tool({
+            "url": "https://mcp.example.com/mcp",
+            "headers": {"Authorization": 123},
+        })
 
 
-def test_build_interactions_tools_validates_allowed_tools() -> None:
+def test_validate_mcp_server_tool_validates_allowed_tools() -> None:
     with pytest.raises(ValueError, match="allowed_tools"):
-        build_interactions_tools(
-            mcp_servers=[{"url": "https://mcp.example.com/mcp", "allowed_tools": ["ok", 42]}]
-        )
+        _validate_mcp_server_tool({
+            "url": "https://mcp.example.com/mcp",
+            "allowed_tools": ["ok", 42],
+        })
 
 
 def test_validate_mcp_servers_supported_rejects_standard_deep_research() -> None:
-    with pytest.raises(ValueError, match="Deep Research Max"):
+    with pytest.raises(ValueError, match="Remote MCP is disabled"):
         validate_mcp_servers_supported(
             agent_name=DeepResearchAgent.DEEP_RESEARCH,
             mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
         )
 
 
-def test_validate_mcp_servers_supported_accepts_deep_research_max() -> None:
-    validate_mcp_servers_supported(
-        agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
-        mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
-    )
+def test_validate_mcp_servers_supported_rejects_deep_research_max() -> None:
+    with pytest.raises(ValueError, match="Remote MCP is disabled"):
+        validate_mcp_servers_supported(
+            agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
+            mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
+        )
 
 
 def test_validate_mcp_servers_supported_accepts_standard_without_mcp() -> None:
@@ -215,7 +234,7 @@ async def test_deep_research_stream_rejects_mcp_on_standard_agent() -> None:
         mcp_servers=[{"url": "https://mcp.example.com/mcp"}],
     )
 
-    with pytest.raises(ValueError, match="Deep Research Max"):
+    with pytest.raises(ValueError, match="Remote MCP is disabled"):
         await anext(stream)
 
 
@@ -269,7 +288,7 @@ def test_analyze_mcp_tool_for_gemini_flags_complex_json_schema_keywords() -> Non
 
 
 @pytest.mark.asyncio
-async def test_deep_research_stream_passes_mcp_servers_to_interactions(
+async def _legacy_deep_research_stream_passes_mcp_servers_to_interactions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -329,6 +348,59 @@ async def test_deep_research_stream_passes_mcp_servers_to_interactions(
             "allowed_tools": [{"tools": ["get_fixture"]}],
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_deep_research_stream_rejects_max_mcp_before_client_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_client_access() -> Any:
+        raise AssertionError("Gemini client must not be accessed")
+
+    monkeypatch.setattr(deep, "_get_healthy_client", fail_client_access)
+    stream = deep_research_stream(
+        "Use the fixture MCP server.",
+        agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
+        mcp_servers=[{"url": "https://fixture.example.com/mcp"}],
+    )
+
+    with pytest.raises(ValueError, match="Remote MCP is disabled"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_server_rejects_mcp_before_clarification_or_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gemini_research_mcp import server
+
+    async def fail_clarification(*args: Any, **kwargs: Any) -> str:
+        raise AssertionError("Clarification must not run")
+
+    def fail_stream(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Deep Research stream must not run")
+
+    monkeypatch.setattr(server, "_maybe_clarify_query", fail_clarification)
+    monkeypatch.setattr(server, "deep_research_stream", fail_stream)
+
+    with pytest.raises(DeepResearchError) as exc_info:
+        await server._run_deep_research_tool(
+            query="Use private MCP data",
+            mcp_servers=[
+                {
+                    "url": "https://user:secret@example.com/mcp?token=secret",
+                    "headers": {"Authorization": "Bearer secret"},
+                }
+            ],
+            agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
+            tool_name="research_deep_max",
+        )
+
+    error = exc_info.value
+    assert error.code == "REMOTE_MCP_DISABLED"
+    assert error.category == ErrorCategory.UNSUPPORTED_FEATURE
+    assert "secret" not in str(error)
+    assert error.details["diagnostic_tool"] == "inspect_mcp_server_for_gemini"
 
 
 @pytest.mark.asyncio

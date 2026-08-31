@@ -75,7 +75,7 @@ jobs:
   build:
     name: build wheel/sdist + MCPB bundle
     runs-on: ubuntu-latest
-    needs: [test, redis-sharing]
+    needs: [test]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -169,6 +169,33 @@ jobs:
           set -euo pipefail
           /tmp/smoke-venv/bin/gemini-research-mcp --version
 
+      - name: Verify Deep Research remote MCP fails before provider access
+        env:
+          GEMINI_API_KEY: fake-test-key-for-smoke-test
+        run: |
+          /tmp/smoke-venv/bin/python - <<'PY'
+          import asyncio
+
+          from gemini_research_mcp import server
+          from gemini_research_mcp.types import DeepResearchAgent, DeepResearchError
+
+          async def main():
+              try:
+                  await server._run_deep_research_tool(
+                      query="must fail before Gemini",
+                      mcp_servers=[{"url": "https://example.invalid/mcp"}],
+                      agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
+                      tool_name="research_deep_max",
+                  )
+              except DeepResearchError as exc:
+                  assert exc.code == "REMOTE_MCP_DISABLED"
+                  assert exc.category.value == "UNSUPPORTED_FEATURE"
+              else:
+                  raise AssertionError("remote MCP request unexpectedly proceeded")
+
+          asyncio.run(main())
+          PY
+
       - name: Verify stdio transport starts and answers MCP initialize
         env:
           GEMINI_API_KEY: fake-test-key-for-smoke-test
@@ -201,4 +228,3 @@ jobs:
           done
           echo "::error::streamable-http server did not respond on 127.0.0.1:8931/mcp"
           exit 1
-
