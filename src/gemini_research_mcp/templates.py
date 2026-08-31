@@ -12,10 +12,10 @@ Inspired by ADK Deep Search Agent's structured sectioning approach.
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class TemplateCategory(str, Enum):
+class TemplateCategory(StrEnum):
     """Categories of format instruction templates."""
 
     BUSINESS = "business"

@@ -5,11 +5,12 @@ flowchart TB
 
     subgraph Server["gemini-research-mcp"]
         direction TB
-        FastMCP["FastMCP 3 Server<br/>@mcp.tool()"]
+        FastMCP["FastMCP 4 Server<br/>@mcp.tool()<br/>BM25SearchTransform"]
         
         subgraph Tools["Tools"]
             RW["research_web<br/>Quick lookup 5-30s"]
             RD["research_deep<br/>Autonomous 3-20min"]
+            RDM["research_deep_max<br/>Max depth"]
             RF["research_followup<br/>Continue session"]
             RR["resume_research<br/>Recover interrupted"]
             FW["fetch_webpage<br/>Content extraction"]
@@ -33,7 +34,7 @@ flowchart TB
     end
 
     subgraph Storage["Persistence"]
-        SQLite["SQLite<br/>~/.gemini-research/"]
+        SQLite["DiskStore (default)<br/>~/.gemini-research/<br/>or Redis/Valkey (distributed)"]
     end
 
     Claude -->|"MCP Protocol"| FastMCP
@@ -41,6 +42,7 @@ flowchart TB
     
     RW --> Quick
     RD --> Deep
+    RDM --> Deep
     RF --> StorageMod
     RR --> StorageMod
     FW --> Content

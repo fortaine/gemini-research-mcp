@@ -7,9 +7,9 @@ Provides AI-powered research tools via Gemini:
 - research_followup: Ask follow-up questions about completed research
 
 Architecture:
-- FastMCP 3.x with Docket-based task support for background tasks (MCP Tasks / SEP-1732)
+- FastMCP 4 with TasksExtension-based task support for background tasks (MCP Tasks / SEP-1732)
 - Task routing via TaskConfig(mode="required") with in-memory Docket backend
-- Elicitation via FastMCP Context.elicit() (input_required pattern)
+- Sessionless guard-pattern elicitation with legacy Context.elicit() compatibility
 - Progress reporting via ctx.report_progress() (task statusMessage channel)
 """
 
@@ -21,28 +21,27 @@ import contextlib
 import json
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.tasks.config import TaskConfig
 from fastmcp.server.transforms.search import BM25SearchTransform
+from fastmcp.utilities.tasks import TaskConfig
+from fastmcp_tasks import TasksExtension
 
 # Raw MCP types
 from mcp.types import (
     BlobResourceContents,
     EmbeddedResource,
     Icon,
+    InputRequiredResult,
     TextContent,
     TextResourceContents,
     ToolAnnotations,
 )
-from pydantic import AnyUrl, BaseModel, Field
+from pydantic import BaseModel, Field
 
 from gemini_research_mcp import __version__
 from gemini_research_mcp.citations import process_citations
@@ -51,11 +50,13 @@ from gemini_research_mcp.config import (
     get_deep_research_agent,
     get_export_dir,
     get_model,
+    is_retryable_error,
 )
 from gemini_research_mcp.content import fetch_webpage as _fetch_webpage
 from gemini_research_mcp.deep import (
     deep_research_stream,
     get_research_status,
+    validate_mcp_servers_supported,
 )
 from gemini_research_mcp.deep import (
     inspect_mcp_server_for_gemini as _inspect_mcp_server_for_gemini,
@@ -75,8 +76,11 @@ from gemini_research_mcp.quick import (
     semantic_match_session,
 )
 from gemini_research_mcp.storage import (
+    ExportArtifact,
+    ResearchSession,
     ResearchStatus,
     delete_research_session,
+    get_export_store,
     get_research_session,
     list_resumable_sessions,
     save_research_session,
@@ -100,51 +104,35 @@ GEMINI_ICON_URL = "https://raw.githubusercontent.com/machinemates-ai/gemini-rese
 
 
 # =============================================================================
-# Ephemeral Export Cache
+# Export Artifact Storage
 # =============================================================================
 
-# TTL for exported files (1 hour)
+# TTL for exported files (1 hour) - enforced by the backend (disk cache TTL or
+# Redis EXPIRE), not by application-level bookkeeping. See storage.py's
+# ExportArtifactStore, which replaced the old in-memory `_export_cache` dict so
+# exports survive restarts and can be shared across worker processes when
+# GEMINI_RESEARCH_STORAGE_URL points multiple instances at the same backend.
 EXPORT_TTL_SECONDS = 3600
+STALE_RESUMABLE_SECONDS = 24 * 60 * 60
+RECENT_FAILED_SECONDS = 24 * 60 * 60
+DEEP_RESEARCH_POLL_MAX_WAIT_SECONDS = 1200
+DEEP_RESEARCH_POLL_INTERVAL_SECONDS = 10
 
 
-@dataclass
-class ExportCacheEntry:
-    """Cached export result with TTL."""
-
-    result: ExportResult
-    session_id: str
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    @property
-    def is_expired(self) -> bool:
-        """Check if the export has expired."""
-        return datetime.now(UTC) > self.created_at + timedelta(seconds=EXPORT_TTL_SECONDS)
+async def _cache_export(result: ExportResult, session_id: str) -> str:
+    """Persist an export artifact and return its unique ID."""
+    return await get_export_store().save_async(
+        session_id=session_id,
+        filename=result.filename,
+        format=result.format.value,
+        mime_type=result.mime_type,
+        content=result.content,
+    )
 
 
-# In-memory cache for exports (keyed by export_id)
-_export_cache: dict[str, ExportCacheEntry] = {}
-
-
-def _cache_export(result: ExportResult, session_id: str) -> str:
-    """Cache an export and return its unique ID."""
-    # Clean up expired entries
-    expired_keys = [k for k, v in _export_cache.items() if v.is_expired]
-    for key in expired_keys:
-        del _export_cache[key]
-
-    export_id = str(uuid.uuid4())[:12]
-    _export_cache[export_id] = ExportCacheEntry(result=result, session_id=session_id)
-    logger.info("   💾 Cached export %s (%s)", export_id, result.size_human)
-    return export_id
-
-
-def _get_cached_export(export_id: str) -> ExportCacheEntry | None:
-    """Retrieve a cached export, or None if expired/missing."""
-    entry = _export_cache.get(export_id)
-    if entry and entry.is_expired:
-        del _export_cache[export_id]
-        return None
-    return entry
+async def _get_cached_export(export_id: str) -> ExportArtifact | None:
+    """Retrieve a persisted export artifact, or None if expired/missing."""
+    return await get_export_store().get_async(export_id)
 
 
 # =============================================================================
@@ -156,10 +144,8 @@ def _get_cached_export(export_id: str) -> ExportCacheEntry | None:
 async def lifespan(app: FastMCP) -> AsyncIterator[None]:
     """Check for resumable sessions on startup.
 
-    Task support is handled entirely by FastMCP's built-in Docket system:
-    - _docket_lifespan() auto-detects TaskConfig-enabled tools
-    - Creates an in-memory Docket (memory://) with a Worker
-    - Registers MCP task protocol handlers (tasks/get, tasks/cancel, etc.)
+    Task support is registered through FastMCP 4 TasksExtension, which
+    discovers TaskConfig-enabled tools and installs the task protocol handlers.
     """
     logger.info("✅ FastMCP Docket task support active")
 
@@ -183,7 +169,8 @@ async def lifespan(app: FastMCP) -> AsyncIterator[None]:
 
 mcp = FastMCP(
     name="Gemini Research",
-    icons=[Icon(src=GEMINI_ICON_URL, mimeType="image/png")],
+    version=__version__,
+    icons=[Icon(src=GEMINI_ICON_URL, mime_type="image/png")],
     instructions="""
 Gemini Research MCP Server - AI-powered research toolkit
 
@@ -233,18 +220,31 @@ Clients that already know a hidden tool name can still call it directly.
 - Ready to hand off a report → `export_research_session(format="docx")`
 - Need another utility → `search_tools`, then `call_tool`
 """,
-    transforms=[
-        BM25SearchTransform(
-            always_visible=[
-                "research_web",
-                "research_deep",
-                "resume_research",
-                "export_research_session",
-            ],
-            max_results=5,
-        )
-    ],
     lifespan=lifespan,
+)
+
+# FastMCP 4 no longer wires the Docket task backend implicitly: TaskConfig-enabled
+# tools require the SEP-2663 tasks extension to be registered explicitly.
+# FASTMCP_DOCKET_URL (unchanged from FastMCP 3) still configures the backend.
+mcp.add_extension(TasksExtension())
+
+# Keep the visible tool catalog compact via BM25 relevance search. The five
+# tools most clients need immediately stay always-visible in list_tools();
+# the rest (fetch_webpage, research_followup, list_research_sessions,
+# list_format_templates, refine_research_plan, inspect_mcp_server_for_gemini)
+# are discoverable via search_tools and remain
+# directly callable by any client that already knows their name.
+mcp.add_transform(
+    BM25SearchTransform(
+        always_visible=[
+            "research_web",
+            "research_deep",
+            "research_deep_max",
+            "resume_research",
+            "export_research_session",
+        ],
+        max_results=5,
+    )
 )
 
 
@@ -262,13 +262,30 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}m {secs}s"
 
 
+def _resume_hint(interaction_id: str) -> str:
+    """Return a concise recovery hint for a persisted Deep Research interaction."""
+    return f"Call `resume_research(interaction_id=\"{interaction_id}\")` to check it."
+
+
+def _refine_plan_hint(interaction_id: str) -> str:
+    """Return a concise hint for refining/approving a collaborative-planning plan."""
+    return (
+        f"Call `refine_research_plan(previous_interaction_id=\"{interaction_id}\", "
+        f'decision="approve")` to run this plan, or '
+        f'decision="iterate" with `instructions=...` to request changes.'
+    )
+
+
 # =============================================================================
 # Helper Functions - Report Formatting
 # =============================================================================
 
 
 def _format_deep_research_report(
-    result: DeepResearchResult, interaction_id: str, elapsed: float
+    result: DeepResearchResult,
+    interaction_id: str,
+    elapsed: float,
+    image_uris: list[str] | None = None,
 ) -> str:
     """Format a deep research result into a markdown report."""
     lines = ["## Research Report"]
@@ -277,6 +294,13 @@ def _format_deep_research_report(
         lines.append(result.text)
     else:
         lines.append("*No report available.*")
+
+    # Images (agent_config.visualization="auto") - resource links, never inlined
+    # into the report text itself so they can't be confused with citations.
+    if image_uris:
+        lines.extend(["", "## Images"])
+        for i, uri in enumerate(image_uris, start=1):
+            lines.append(f"- [Image {i}]({uri})")
 
     # Usage stats
     if result.usage:
@@ -299,12 +323,85 @@ def _format_deep_research_report(
     return "\n".join(lines)
 
 
+def _format_plan_response(plan_text: str, interaction_id: str) -> str:
+    """Format a collaborative-planning "plan_ready" response (not the final report)."""
+    lines = [
+        "## Research Plan (awaiting approval)",
+        "",
+        plan_text or "*No plan text was returned by the agent.*",
+        "",
+        "---",
+        f"- Interaction ID: `{interaction_id}`",
+        f"- {_refine_plan_hint(interaction_id)}",
+    ]
+    return "\n".join(lines)
+
+
+async def _persist_deep_research_image(
+    *,
+    session_id: str,
+    index: int,
+    data_b64: str | None,
+    mime_type: str | None,
+    uri: str | None,
+) -> tuple[str | None, str]:
+    """Persist a Deep Research image as an export artifact.
+
+    Returns (export_id, resource_uri). When no inline base64 data is available
+    (only a hosted `uri`), the image is not re-persisted - the original URI is
+    passed through as-is, and export_id is None.
+    """
+    if not data_b64:
+        return None, uri or ""
+
+    import base64
+    import mimetypes
+
+    content = base64.b64decode(data_b64)
+    resolved_mime = mime_type or "image/png"
+    extension = mimetypes.guess_extension(resolved_mime) or ".png"
+    filename = f"deep-research-image-{index}{extension}"
+
+    export_id = await get_export_store().save_async(
+        session_id=session_id,
+        filename=filename,
+        format="image",
+        mime_type=resolved_mime,
+        content=content,
+    )
+    return export_id, f"research://exports/{export_id}"
+
+
+async def _persist_deep_research_images(
+    *, session_id: str, images: list[dict[str, object]]
+) -> tuple[list[str], list[str]]:
+    """Persist a batch of Deep Research images, returning (export_ids, resource_uris)."""
+    export_ids: list[str] = []
+    resource_uris: list[str] = []
+    for index, image in enumerate(images):
+        data = image.get("data")
+        mime_type = image.get("mime_type")
+        uri = image.get("uri")
+        export_id, resource_uri = await _persist_deep_research_image(
+            session_id=session_id,
+            index=index,
+            data_b64=data if isinstance(data, str) else None,
+            mime_type=mime_type if isinstance(mime_type, str) else None,
+            uri=uri if isinstance(uri, str) else None,
+        )
+        if resource_uri:
+            resource_uris.append(resource_uri)
+        if export_id:
+            export_ids.append(export_id)
+    return export_ids, resource_uris
+
+
 # =============================================================================
 # Tools
 # =============================================================================
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 async def research_web(
     query: Annotated[str, "Search query or question to research on the web"],
     include_thoughts: Annotated[bool, "Include thinking summary in response"] = False,
@@ -380,7 +477,11 @@ async def research_web(
 # =============================================================================
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True, idempotentHint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        read_only_hint=True, open_world_hint=True, idempotent_hint=True
+    )
+)
 async def fetch_webpage(
     url: Annotated[str, "URL of the webpage to fetch and extract content from"],
     max_length: Annotated[
@@ -462,15 +563,29 @@ async def fetch_webpage(
 
 
 # =============================================================================
-# SEP-1686: Elicitation via Context.elicit()
+# SEP-2322 / SEP-2577: Elicitation, dual-era
 # =============================================================================
 #
-# The MCP SDK's FastMCP Context supports elicitation directly via ctx.elicit().
-# This works in foreground (non-task) mode. For background tasks (SEP-1732),
-# the ServerTaskContext provides elicit() with input_required status management.
+# Two independent MCP eras need two different mechanisms:
 #
-# Current implementation: Foreground elicitation via ctx.elicit()
-# TODO: Background task elicitation via ServerTaskContext when client supports it
+# - Handshake-era foreground calls (protocol <= 2025-11-25, no MCP Task) keep a
+#   bidirectional session channel open for the duration of a tool call, so the
+#   server can push a mid-call request via ctx.elicit() and block for the answer.
+# - The 2026-07-28 era is sessionless: every request/response pair is a complete,
+#   independent transaction. There is no back-channel to push a question on, and
+#   the same is true for ANY call running as an MCP Task (research_deep and
+#   research_deep_max always run as tasks per TaskConfig(mode="required")).
+#   ctx.elicit() raises ToolError in both of these situations.
+#
+# The sessionless/task replacement is the SEP-2322 guard pattern: the tool
+# returns InputRequiredResult describing what it needs; that ends the current
+# call; the client answers and calls the SAME tool again with the same
+# arguments plus the answer available via ctx.input_responses. Because the
+# heuristics below are a pure function of `query`, no server-side state needs
+# to survive between the two calls - the tool simply recomputes the same
+# `questions` deterministically and reads the answer out of input_responses.
+
+_CLARIFY_INPUT_KEY = "clarify_query"
 
 
 class ClarificationSchema(BaseModel):
@@ -481,81 +596,165 @@ class ClarificationSchema(BaseModel):
     answer_3: str = Field(default="", description="Answer to third clarifying question")
 
 
+def _uses_sessionless_guard_pattern(ctx: Context) -> bool:
+    """True when ctx.elicit() would raise: sessionless protocol era or an MCP Task.
+
+    Mirrors FastMCP's own era check (Context._is_modern_protocol) plus the
+    background-task check documented on Context.elicit(): "Imperative
+    elicitation is not available inside a background task."
+    """
+    if ctx.is_background_task:
+        return True
+    request_context = ctx.request_context
+    if request_context is None:
+        return False
+    from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+
+    return request_context.protocol_version in MODERN_PROTOCOL_VERSIONS
+
+
+def _build_clarification_guard(query: str, questions: list[str]) -> InputRequiredResult:
+    """Build the InputRequiredResult that asks the client for clarification answers."""
+    from fastmcp.server.elicitation import get_elicitation_schema
+    from mcp.types import ElicitRequest, ElicitRequestFormParams
+    from pydantic import create_model
+
+    field_definitions = {
+        f"answer_{i + 1}": (str, Field(default="", description=q))
+        for i, q in enumerate(questions)
+    }
+    dynamic_schema = create_model("ClarificationQuestions", **field_definitions)  # type: ignore
+
+    message = (
+        f"To improve research quality for:\n\n**\"{query}\"**\n\n"
+        f"Please answer these questions (optional - leave blank to continue):"
+    )
+
+    request = ElicitRequest(
+        params=ElicitRequestFormParams(
+            mode="form",
+            message=message,
+            requested_schema=get_elicitation_schema(dynamic_schema),
+        )
+    )
+    return InputRequiredResult(
+        input_requests={_CLARIFY_INPUT_KEY: request},
+        # Compact, non-sensitive correlation marker only - never the full
+        # request or an authentication secret. The questions themselves are
+        # recomputed deterministically from `query` on the resumed call.
+        request_state="clarify_query",
+    )
+
+
+def _apply_clarification_answer(query: str, questions: list[str], elicit_result: object) -> str:
+    """Fold an answered guard-pattern elicitation back into the query."""
+    action = getattr(elicit_result, "action", None)
+    content = getattr(elicit_result, "content", None)
+    if action != "accept" or not content:
+        logger.info("   ⏭️ User skipped/declined/cancelled clarification (guard pattern)")
+        return query
+
+    answers = [content.get(f"answer_{i + 1}", "") for i in range(len(questions))]
+    non_empty = [a for a in answers if a.strip()]
+    if not non_empty:
+        logger.info("   ⏭️ User submitted but answers empty (guard pattern)")
+        return query
+
+    logger.info("   ✨ User provided %d/%d answers (guard pattern)", len(non_empty), len(questions))
+    clarification = "\n".join(
+        f"Q: {q}\nA: {a}" for q, a in zip(questions, answers, strict=False) if a.strip()
+    )
+    refined = f"{query}\n\nAdditional context:\n{clarification}"
+    logger.info("   📝 Refined query: %s", refined[:100])
+    return refined
+
+
+def _detect_clarifying_questions(query: str) -> list[str]:
+    """Pure heuristic: return clarifying questions for a vague query, or [] if specific enough.
+
+    Deliberately side-effect free so both elicitation eras (and the resumed
+    guard-pattern call) recompute the identical question set from `query` alone.
+    """
+    query_lower = query.lower()
+    query_len = len(query)
+    questions: list[str] = []
+
+    # Comprehensive queries (200+ chars with multiple sentences) skip clarification.
+    has_multiple_points = query.count("(") >= 2 or query.count(",") >= 3
+    if query_len >= 200 and has_multiple_points:
+        return []
+
+    if query_len < 30:
+        questions.append("Can you provide more context about what you're looking for?")
+
+    comparative_terms = ["compare", "vs", "versus", "best", "top"]
+    has_comparative = any(term in query_lower for term in comparative_terms)
+    if has_comparative and query_len < 100 and not any(c.isdigit() for c in query):
+        questions.append("What specific aspects would you like to compare?")
+        questions.append("What's your use case or context?")
+
+    has_topic_term = any(term in query_lower for term in ["research", "analyze", "investigate"])
+    if has_topic_term and query_len < 100:
+        questions.append("What specific angle or focus area interests you?")
+        questions.append("What's the timeframe or scope you're interested in?")
+
+    if "best practice" in query_lower and query_len < 100:
+        questions.append("What industry or domain are you in?")
+        questions.append("What's the scale or context (startup, enterprise, etc.)?")
+
+    return questions[:3]
+
+
 async def _maybe_clarify_query(
     query: str,
     ctx: Context | None,
-) -> str:
+) -> str | InputRequiredResult:
     """
-    Analyze query and optionally ask clarifying questions via ctx.elicit().
+    Analyze query and optionally ask clarifying questions.
 
-    Uses heuristics to detect vague queries and prompts for clarification.
+    Uses heuristics to detect vague queries and prompts for clarification via
+    ctx.elicit() (handshake-era foreground calls) or the SEP-2322 guard pattern
+    (sessionless protocol / MCP Tasks - see module docstring above).
 
     Args:
         query: The research query
-        ctx: MCP Context (None when running in background task)
+        ctx: MCP Context (None when running with no context at all)
 
-    Returns the refined query, or original if clarification was skipped/unavailable.
+    Returns the refined query, the original if clarification was skipped/
+    unavailable, or an InputRequiredResult if the client must be asked first
+    (the tool call ends here; the client re-invokes with the answer).
     """
     if ctx is None:
         logger.info("🔍 Skipping clarification (no context)")
         return query
 
-    # Simple heuristics for detecting vague queries
-    query_lower = query.lower()
-    query_len = len(query)
+    questions = _detect_clarifying_questions(query)
 
-    is_vague = False
-    questions: list[str] = []
-
-    # Comprehensive queries (200+ chars with multiple sentences) skip clarification
-    # This catches detailed requests with format_instructions, multiple criteria, etc.
-    has_multiple_points = query.count("(") >= 2 or query.count(",") >= 3
-    is_comprehensive = query_len >= 200 and has_multiple_points
-
-    if is_comprehensive:
-        logger.info("   ✅ Query is comprehensive (%d chars), skipping clarification", query_len)
-        return query
-
-    # Very short queries are often vague
-    if query_len < 30:
-        is_vague = True
-        questions.append("Can you provide more context about what you're looking for?")
-
-    # Generic comparative terms (only for short queries)
-    comparative_terms = ["compare", "vs", "versus", "best", "top"]
-    has_comparative = any(term in query_lower for term in comparative_terms)
-    if has_comparative and query_len < 100 and not any(c.isdigit() for c in query):
-        is_vague = True
-        questions.append("What specific aspects would you like to compare?")
-        questions.append("What's your use case or context?")
-
-    # Generic topic terms (only for short queries)
-    has_topic_term = any(term in query_lower for term in ["research", "analyze", "investigate"])
-    if has_topic_term and query_len < 100:
-        is_vague = True
-        questions.append("What specific angle or focus area interests you?")
-        questions.append("What's the timeframe or scope you're interested in?")
-
-    # "Best practices" without context (only for short queries)
-    if "best practice" in query_lower and query_len < 100:
-        is_vague = True
-        questions.append("What industry or domain are you in?")
-        questions.append("What's the scale or context (startup, enterprise, etc.)?")
-
-    if not is_vague or not questions:
+    # Comprehensive/specific queries need no clarification at all.
+    if not questions:
         logger.info("   ✅ Query is specific enough, no clarification needed")
         return query
 
-    # Trim to 3 questions max
-    questions = questions[:3]
+    # Resume path: the client already answered this exact guard-pattern round.
+    # (ctx.input_responses is only populated on a call that follows an
+    # InputRequiredResult; it is None on a fresh call.)
+    if ctx.input_responses is not None:
+        pending = ctx.input_responses.get(_CLARIFY_INPUT_KEY)
+        if pending is not None:
+            return _apply_clarification_answer(query, questions, pending)
+
     logger.info("   🎯 Query may need clarification: %d questions", len(questions))
 
+    if _uses_sessionless_guard_pattern(ctx):
+        return _build_clarification_guard(query, questions)
+
+    # Handshake-era foreground path: ctx.elicit() keeps the connection open
+    # and blocks for the answer in a single call.
     try:
-        # Build dynamic schema with actual questions as descriptions
         from pydantic import create_model
 
         field_definitions = {
-            f"answer_{i+1}": (str, Field(default="", description=q))
+            f"answer_{i + 1}": (str, Field(default="", description=q))
             for i, q in enumerate(questions)
         }
         DynamicSchema = create_model("ClarificationQuestions", **field_definitions)  # type: ignore
@@ -607,10 +806,12 @@ async def _run_deep_research_tool(
     format_instructions: str | None = None,
     file_search_store_names: list[str] | None = None,
     mcp_servers: list[dict[str, object]] | None = None,
+    visualization: str = "off",
+    collaborative_planning: bool = False,
+    ctx: Context | None = None,
     agent_name: DeepResearchAgent,
     tool_name: str,
-    ctx: Context | None = None,
-) -> str:
+) -> str | InputRequiredResult:
     """
     Comprehensive autonomous research agent (3-20 minutes). Requires MCP
     Tasks support on the client (SEP-1732) — without it, the call is
@@ -631,17 +832,17 @@ async def _run_deep_research_tool(
         query: Research question or topic (can be vague — clarification is
             automatic).
         format_instructions: Optional report structure/tone guidance
-            (e.g. "executive briefing", "comparison table", or a
-            registered template key — see `list_format_templates`).
-        file_search_store_names: Optional Gemini File Search stores to RAG
-            over your own data alongside the web.
-        mcp_servers: Optional remote MCP servers for custom/private data and tools.
+        file_search_store_names: Optional file stores for RAG over your own data
+        mcp_servers: Optional remote MCP servers for custom/private data and tools
+        visualization: "off" (default) or "auto" - allow the agent to include
+            chart/diagram images in its response
+        collaborative_planning: When True, return the drafted research plan (not
+            the final report) plus an interaction ID; use refine_research_plan to
+            iterate on or approve the plan afterwards
 
     Returns:
-        Comprehensive research report with citations. The returned
-        `interaction_id` can be passed to `resume_research` (on
-        interruption) or `export_research_session` (to materialize the
-        report as DOCX/Markdown/JSON).
+        Comprehensive research report with citations, or (when
+        collaborative_planning=True) the drafted plan awaiting approval.
     """
     logger.info("🔬 %s (%s): %s", tool_name, agent_name.value, query[:100])
     if format_instructions:
@@ -654,6 +855,15 @@ async def _run_deep_research_tool(
             for server in mcp_servers
         ]
         logger.info("   🔌 MCP servers: %s", names)
+        try:
+            validate_mcp_servers_supported(agent_name=agent_name, mcp_servers=mcp_servers)
+        except ValueError as exc:
+            raise DeepResearchError("INVALID_REQUEST", str(exc)) from exc
+        logger.warning(
+            "   ⚠️ Remote MCP for Deep Research is experimental and currently gated to "
+            "Deep Research Max. Validate each endpoint with a marker result-inclusion "
+            "probe before relying on the output."
+        )
 
     # Resolve template key to full template instructions
     effective_format = format_instructions
@@ -671,6 +881,13 @@ async def _run_deep_research_tool(
     # Phase 1: Query Clarification (if ctx available)
     # ==========================================================================
     effective_query = await _maybe_clarify_query(query, ctx)
+
+    if isinstance(effective_query, InputRequiredResult):
+        # SEP-2322 guard: this call ends here. The client answers and calls
+        # this same tool again with the same arguments; ctx.input_responses
+        # will then carry the answer and _maybe_clarify_query resumes cleanly.
+        logger.info("   ❓ Clarification required (guard pattern) - awaiting client answer")
+        return effective_query
 
     if effective_query != query:
         logger.info("   ✨ Using refined query")
@@ -693,9 +910,12 @@ async def _run_deep_research_tool(
     try:
         thought_count = 0
         action_count = 0
+        text_parts: list[str] = []
+        image_events: list[dict[str, object]] = []
         interaction_id: str | None = None
         session_saved = False  # Track if we saved session at start
         initial_title: str | None = None  # Generated title for the session
+        plan_ready = False
 
         # Consume the stream to get interaction_id and track progress
         async for event in deep_research_stream(
@@ -704,6 +924,8 @@ async def _run_deep_research_tool(
             file_search_store_names=file_search_store_names,
             mcp_servers=mcp_servers,
             agent_name=agent_name,
+            visualization=visualization,
+            collaborative_planning=collaborative_planning,
         ):
             if event.interaction_id:
                 interaction_id = event.interaction_id
@@ -724,7 +946,11 @@ async def _run_deep_research_tool(
                             title=initial_title,
                             format_instructions=format_instructions,
                             agent_name=agent_name,
-                            status=ResearchStatus.IN_PROGRESS,
+                            status=(
+                                ResearchStatus.PLANNING
+                                if collaborative_planning
+                                else ResearchStatus.IN_PROGRESS
+                            ),
                         )
                         session_saved = True
                         logger.info("   💾 Session saved (in_progress) for resume support")
@@ -752,6 +978,17 @@ async def _run_deep_research_tool(
                         total=100,
                         message=f"[{action_count}] 🔍 {short}",
                     )
+            elif event.event_type == "text":
+                if event.content:
+                    text_parts.append(event.content)
+            elif event.event_type == "image":
+                # Never folded into text_parts - collected separately and
+                # persisted as export artifacts once the interaction_id is known.
+                image_events.append({
+                    "data": event.content,
+                    "mime_type": event.image_mime_type,
+                    "uri": event.image_uri,
+                })
             elif event.event_type == "start":
                 if ctx:
                     await ctx.report_progress(
@@ -759,123 +996,79 @@ async def _run_deep_research_tool(
                         total=100,
                         message="🚀 Research started",
                     )
+            elif event.event_type == "plan_ready":
+                plan_ready = True
+                break
             elif event.event_type == "error":
-                logger.error("   Stream error: %s", event.content)
-                # Mark session as failed if we have interaction_id
+                error_content = str(event.content or "Deep Research stream error")
+                logger.error("   Stream error: %s", error_content)
+                retryable = is_retryable_error(error_content)
+                # Preserve recoverability for transient stream failures.
                 if interaction_id and session_saved:
                     with contextlib.suppress(Exception):
                         update_research_session(
                             interaction_id,
-                            status=ResearchStatus.FAILED,
+                            status=(
+                                ResearchStatus.INTERRUPTED
+                                if retryable
+                                else ResearchStatus.FAILED
+                            ),
                         )
+                if retryable and interaction_id:
+                    raise DeepResearchError(
+                        code="RESEARCH_INTERRUPTED",
+                        message=(
+                            f"Deep Research stream was interrupted by a retryable error: "
+                            f"{error_content}. Interaction ID: {interaction_id}. "
+                            f"{_resume_hint(interaction_id)}"
+                        ),
+                        details={"interaction_id": interaction_id},
+                    )
                 raise DeepResearchError(
                     code="RESEARCH_FAILED",
-                    message=str(event.content or "Deep Research stream error"),
+                    message=error_content,
                     details={"interaction_id": interaction_id},
                 )
 
         if not interaction_id:
             raise ValueError("No interaction_id received from stream")
 
-        logger.info("   📊 Stream consumed: %d thoughts, %d actions", thought_count, action_count)
-
-        if ctx:
-            await ctx.report_progress(
-                progress=50,
-                total=100,
-                message="⏳ Waiting for completion...",
-            )
-
-        # Poll for completion
-        max_wait = 1200  # 20 minutes max
-        poll_interval = 10  # 10 seconds between polls
-        poll_start = time.time()
-
-        while time.time() - poll_start < max_wait:
-            result = await get_research_status(interaction_id)
-
-            raw_status = "unknown"
-            if result.raw_interaction:
-                raw_status = getattr(result.raw_interaction, "status", "unknown")
-
-            elapsed = time.time() - start
-
-            if raw_status == "completed":
-                logger.info("   ✅ Research completed in %s", _format_duration(elapsed))
-
-                result = await process_citations(result, resolve_urls=True)
-
-                # Auto-save session for later follow-up
-                total_tokens = None
-                if result.usage and result.usage.total_tokens:
-                    total_tokens = result.usage.total_tokens
-
-                # Generate title and summary in one call (~$0.0003/call)
-                metadata = await generate_session_metadata(
-                    text=result.text or "",
-                    query=effective_query,
-                )
-
-                # Update session with completion data (session saved at start)
-                try:
+        if plan_ready:
+            plan_text = "".join(text_parts).strip()
+            try:
+                if session_saved:
                     update_research_session(
                         interaction_id,
-                        title=metadata.title or None,
-                        summary=metadata.summary or None,
-                        report_text=result.text,
-                        duration_seconds=elapsed,
-                        total_tokens=total_tokens,
-                        status=ResearchStatus.COMPLETED,
+                        status=ResearchStatus.AWAITING_APPROVAL,
+                        plan_text=plan_text,
                     )
-                    logger.info("   💾 Session updated (completed)")
-                except Exception as save_error:
-                    logger.warning(
-                        "⚠️ Failed to update session (research succeeded): %s",
-                        save_error,
+                else:
+                    save_research_session(
+                        interaction_id=interaction_id,
+                        query=effective_query,
+                        title=initial_title or effective_query[:60],
+                        format_instructions=format_instructions,
+                        agent_name=agent_name,
+                        status=ResearchStatus.AWAITING_APPROVAL,
+                        plan_text=plan_text,
                     )
-
-                return _format_deep_research_report(result, interaction_id, elapsed)
-
-            elif raw_status in ("failed", "cancelled", "canceled"):
-                logger.error("   ❌ Research %s after %s", raw_status, _format_duration(elapsed))
-                # Mark session with appropriate status
-                if session_saved:
-                    session_status = (
-                        ResearchStatus.CANCELLED
-                        if raw_status in ("cancelled", "canceled")
-                        else ResearchStatus.FAILED
-                    )
-                    with contextlib.suppress(Exception):
-                        update_research_session(
-                            interaction_id,
-                            status=session_status,
-                            duration_seconds=elapsed,
-                        )
-                raise DeepResearchError(
-                    code=f"RESEARCH_{raw_status.upper()}",
-                    message=f"Research {raw_status} after {_format_duration(elapsed)}",
+                logger.info("   💾 Session updated (awaiting_approval)")
+            except Exception as save_error:
+                logger.warning(
+                    "⚠️ Failed to update session (plan ready): %s", save_error
                 )
-            else:
-                # Still working - report progress
-                if ctx:
-                    progress_pct = min(90, int(50 + (elapsed / max_wait) * 40))
-                    await ctx.report_progress(
-                        progress=progress_pct,
-                        total=100,
-                        message=f"⏳ Researching... ({_format_duration(elapsed)})",
-                    )
+            return _format_plan_response(plan_text, interaction_id)
 
-            await asyncio.sleep(poll_interval)
+        logger.info("   📊 Stream consumed: %d thoughts, %d actions", thought_count, action_count)
 
-        # Timeout
-        elapsed = time.time() - start
-        raise DeepResearchError(
-            code="TIMEOUT",
-            message=(
-                f"Research timed out after {_format_duration(elapsed)}. "
-                f"Interaction ID: {interaction_id}"
-            ),
-            details={"interaction_id": interaction_id},
+        return await _poll_deep_research_to_completion(
+            interaction_id=interaction_id,
+            effective_query=effective_query,
+            start=start,
+            text_parts=text_parts,
+            image_events=image_events,
+            session_saved=session_saved,
+            ctx=ctx,
         )
 
     except DeepResearchError:
@@ -888,8 +1081,149 @@ async def _run_deep_research_tool(
         ) from e
 
 
+async def _poll_deep_research_to_completion(
+    *,
+    interaction_id: str,
+    effective_query: str,
+    start: float,
+    text_parts: list[str],
+    image_events: list[dict[str, object]],
+    session_saved: bool,
+    ctx: Context | None,
+) -> str:
+    """Poll a running Deep Research interaction until it completes, fails, or times out.
+
+    Shared by `_run_deep_research_tool` (initial run) and `refine_research_plan`
+    (post-approval execution) so both paths persist images, update the stored
+    session, and format the final report identically.
+    """
+    if ctx:
+        await ctx.report_progress(
+            progress=50,
+            total=100,
+            message="⏳ Waiting for completion...",
+        )
+
+    # Poll for completion
+    max_wait = DEEP_RESEARCH_POLL_MAX_WAIT_SECONDS
+    poll_interval = DEEP_RESEARCH_POLL_INTERVAL_SECONDS
+    poll_start = time.time()
+
+    while time.time() - poll_start < max_wait:
+        result = await get_research_status(interaction_id)
+
+        raw_status = "unknown"
+        if result.raw_interaction:
+            raw_status = getattr(result.raw_interaction, "status", "unknown")
+
+        elapsed = time.time() - start
+
+        if raw_status == "completed":
+            logger.info("   ✅ Research completed in %s", _format_duration(elapsed))
+
+            streamed_text = "".join(text_parts)
+            if not (result.text or "").strip() and streamed_text.strip():
+                result.text = streamed_text
+
+            result = await process_citations(result, resolve_urls=True)
+
+            # Persist any images (agent_config.visualization="auto"). Prefer the
+            # final/non-streaming interaction's images (fully-formed content
+            # items) and fall back to what was collected while streaming.
+            final_images = result.images or image_events
+            image_export_ids, image_uris = await _persist_deep_research_images(
+                session_id=interaction_id, images=final_images
+            )
+
+            # Auto-save session for later follow-up
+            total_tokens = None
+            if result.usage and result.usage.total_tokens:
+                total_tokens = result.usage.total_tokens
+
+            # Generate title and summary in one call (~$0.0003/call)
+            metadata = await generate_session_metadata(
+                text=result.text or "",
+                query=effective_query,
+            )
+
+            # Update session with completion data (session saved at start)
+            try:
+                update_research_session(
+                    interaction_id,
+                    title=metadata.title or None,
+                    summary=metadata.summary or None,
+                    report_text=result.text,
+                    duration_seconds=elapsed,
+                    total_tokens=total_tokens,
+                    status=ResearchStatus.COMPLETED,
+                    image_export_ids=image_export_ids,
+                )
+                logger.info("   💾 Session updated (completed)")
+            except Exception as save_error:
+                logger.warning(
+                    "⚠️ Failed to update session (research succeeded): %s",
+                    save_error,
+                )
+
+            return _format_deep_research_report(result, interaction_id, elapsed, image_uris)
+
+        elif raw_status in ("failed", "cancelled", "canceled"):
+            logger.error("   ❌ Research %s after %s", raw_status, _format_duration(elapsed))
+            # Mark session with appropriate status
+            if session_saved:
+                session_status = (
+                    ResearchStatus.CANCELLED
+                    if raw_status in ("cancelled", "canceled")
+                    else ResearchStatus.FAILED
+                )
+                with contextlib.suppress(Exception):
+                    update_research_session(
+                        interaction_id,
+                        status=session_status,
+                        duration_seconds=elapsed,
+                    )
+            raise DeepResearchError(
+                code=f"RESEARCH_{raw_status.upper()}",
+                message=f"Research {raw_status} after {_format_duration(elapsed)}",
+            )
+        else:
+            # Still working - report progress
+            if ctx:
+                progress_pct = min(90, int(50 + (elapsed / max_wait) * 40))
+                await ctx.report_progress(
+                    progress=progress_pct,
+                    total=100,
+                    message=f"⏳ Researching... ({_format_duration(elapsed)})",
+                )
+
+        await asyncio.sleep(poll_interval)
+
+    # Timeout
+    elapsed = time.time() - start
+    if session_saved:
+        with contextlib.suppress(Exception):
+            update_research_session(
+                interaction_id,
+                status=ResearchStatus.INTERRUPTED,
+                duration_seconds=elapsed,
+            )
+    return "\n".join(
+        [
+            "## Research Still Running",
+            "",
+            (
+                f"Deep Research did not finish within {_format_duration(elapsed)}, "
+                "but the Gemini interaction was saved for recovery."
+            ),
+            "",
+            f"- Interaction ID: `{interaction_id}`",
+            f"- Recovery: {_resume_hint(interaction_id)}",
+        ]
+    )
+
+
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
 )
 async def inspect_mcp_server_for_gemini(
     url: Annotated[str, "HTTPS MCP server endpoint URL to inspect"],
@@ -920,7 +1254,7 @@ async def inspect_mcp_server_for_gemini(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     task=TaskConfig(mode="required"),
 )
 async def research_deep(
@@ -937,17 +1271,44 @@ async def research_deep(
         list[dict[str, object]] | None,
         (
             "Optional remote MCP server configs for Deep Research. Each item may include "
-            "name, url, headers, and allowed_tools."
+            "name, url, headers, and allowed_tools. Remote MCP requires Deep Research "
+            "Max; use research_deep_max or set DEEP_RESEARCH_AGENT to "
+            "deep-research-max-preview-04-2026."
         ),
     ] = None,
+    visualization: Annotated[
+        Literal["off", "auto"],
+        "'auto' allows the agent to include chart/diagram images in its response",
+    ] = "off",
+    collaborative_planning: Annotated[
+        bool,
+        (
+            "When True, return the drafted research plan (not the final report) plus "
+            "an interaction ID; call refine_research_plan afterwards to iterate on or "
+            "approve the plan"
+        ),
+    ] = False,
     ctx: Context | None = None,
-) -> str:
-    """Run the default Deep Research agent with optional File Search and MCP tools."""
+) -> str | InputRequiredResult:
+    """
+    Comprehensive autonomous research agent. Takes 3-20 minutes.
+
+    Uses the fast/default April 2026 Deep Research agent. Use this by default for
+    interactive questions, exploratory research, competitive analysis, comparisons,
+    and latency/cost-sensitive multi-source synthesis.
+
+    For maximum-comprehensiveness research, use research_deep_max instead.
+
+    For vague queries, the tool automatically asks clarifying questions
+    to refine the research scope before starting (when elicitation is available).
+    """
     return await _run_deep_research_tool(
         query=query,
         format_instructions=format_instructions,
         file_search_store_names=file_search_store_names,
         mcp_servers=mcp_servers,
+        visualization=visualization,
+        collaborative_planning=collaborative_planning,
         agent_name=get_deep_research_agent(),
         tool_name="research_deep",
         ctx=ctx,
@@ -955,7 +1316,7 @@ async def research_deep(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
     task=TaskConfig(mode="required"),
 )
 async def research_deep_max(
@@ -972,17 +1333,41 @@ async def research_deep_max(
         list[dict[str, object]] | None,
         (
             "Optional remote MCP server configs for Deep Research Max. Each item may "
-            "include name, url, headers, and allowed_tools."
+            "include name, url, headers, and allowed_tools. This is the supported "
+            "remote-MCP path for result-inclusion validation."
         ),
     ] = None,
+    visualization: Annotated[
+        Literal["off", "auto"],
+        "'auto' allows the agent to include chart/diagram images in its response",
+    ] = "off",
+    collaborative_planning: Annotated[
+        bool,
+        (
+            "When True, return the drafted research plan (not the final report) plus "
+            "an interaction ID; call refine_research_plan afterwards to iterate on or "
+            "approve the plan"
+        ),
+    ] = False,
     ctx: Context | None = None,
-) -> str:
-    """Run Deep Research Max for maximum-comprehensiveness background research."""
+) -> str | InputRequiredResult:
+    """
+    Maximum-comprehensiveness autonomous research agent.
+
+    Use when the user explicitly says "Max", "deep research max", "exhaustive",
+    "comprehensive", "due diligence", "market map", "literature review",
+    "high stakes", "board-ready", "offline/nightly", or asks for maximum
+    completeness over speed.
+
+    For ordinary interactive research, use research_deep instead.
+    """
     return await _run_deep_research_tool(
         query=query,
         format_instructions=format_instructions,
         file_search_store_names=file_search_store_names,
         mcp_servers=mcp_servers,
+        visualization=visualization,
+        collaborative_planning=collaborative_planning,
         agent_name=DeepResearchAgent.DEEP_RESEARCH_MAX,
         tool_name="research_deep_max",
         ctx=ctx,
@@ -990,11 +1375,166 @@ async def research_deep_max(
 
 
 # =============================================================================
+# refine_research_plan: Iterate on or approve a collaborative-planning session
+# =============================================================================
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+    task=TaskConfig(mode="required"),
+)
+async def refine_research_plan(
+    previous_interaction_id: Annotated[
+        str,
+        (
+            "Interaction ID returned by research_deep/research_deep_max when "
+            "collaborative_planning=True"
+        ),
+    ],
+    decision: Annotated[
+        Literal["iterate", "approve"],
+        (
+            "'iterate' requests a revised plan (use instructions for feedback); "
+            "'approve' executes the approved plan and returns the final report"
+        ),
+    ],
+    instructions: Annotated[
+        str | None,
+        "Feedback for a new plan iteration, or extra guidance while executing the plan",
+    ] = None,
+    ctx: Context | None = None,
+) -> str:
+    """
+    Continue a collaborative-planning Deep Research session.
+
+    Call this with the interaction_id returned by research_deep/research_deep_max
+    after they returned a plan awaiting approval (collaborative_planning=True).
+
+    - decision="iterate": request a revised plan; returns the new plan text plus
+      a new interaction_id to pass back into this tool.
+    - decision="approve": execute the approved plan; returns the final report
+      once Deep Research completes (this call can take several minutes).
+    """
+    logger.info(
+        "🗂️ refine_research_plan: id=%s decision=%s", previous_interaction_id, decision
+    )
+
+    session = get_research_session(previous_interaction_id)
+    if session is None:
+        return (
+            f"❌ No research session found for interaction_id `{previous_interaction_id}`. "
+            "Call research_deep(..., collaborative_planning=True) first."
+        )
+    if session.status != ResearchStatus.AWAITING_APPROVAL:
+        return (
+            f"❌ Session `{previous_interaction_id}` is not awaiting plan approval "
+            f"(current status: `{session.status.value}`)."
+        )
+
+    agent_name = session.agent_name or get_deep_research_agent()
+    start = time.time()
+    text_parts: list[str] = []
+    image_events: list[dict[str, object]] = []
+    new_interaction_id: str | None = None
+    plan_ready = False
+
+    follow_up_query = instructions or (
+        "Please revise the plan based on this feedback and share an updated plan."
+        if decision == "iterate"
+        else "The plan is approved. Please proceed to execute the research and produce "
+        "the final report."
+    )
+
+    try:
+        async for event in deep_research_stream(
+            query=follow_up_query,
+            agent_name=agent_name,
+            visualization="off",
+            collaborative_planning=(decision == "iterate"),
+            previous_interaction_id=previous_interaction_id,
+        ):
+            if event.interaction_id:
+                new_interaction_id = event.interaction_id
+
+            if event.event_type == "text":
+                if event.content:
+                    text_parts.append(event.content)
+            elif event.event_type == "image":
+                image_events.append({
+                    "data": event.content,
+                    "mime_type": event.image_mime_type,
+                    "uri": event.image_uri,
+                })
+            elif event.event_type == "plan_ready":
+                plan_ready = True
+                break
+            elif event.event_type == "error":
+                error_content = str(event.content or "Deep Research stream error")
+                logger.error("   Stream error: %s", error_content)
+                raise DeepResearchError(
+                    code="RESEARCH_STREAM_ERROR", message=error_content
+                )
+
+        if not new_interaction_id:
+            raise DeepResearchError(
+                code="INTERNAL_ERROR",
+                message="No interaction_id returned by plan continuation",
+            )
+
+        if decision == "iterate" and plan_ready:
+            plan_text = "".join(text_parts)
+            try:
+                save_research_session(
+                    interaction_id=new_interaction_id,
+                    query=session.query,
+                    title=session.title or session.query[:60],
+                    format_instructions=session.format_instructions,
+                    agent_name=agent_name,
+                    status=ResearchStatus.AWAITING_APPROVAL,
+                    plan_text=plan_text,
+                )
+            except Exception as save_error:
+                logger.warning(
+                    "⚠️ Failed to save refined plan session: %s", save_error
+                )
+            return _format_plan_response(plan_text, new_interaction_id)
+
+        # decision == "approve" (or the agent proceeded straight to execution).
+        try:
+            save_research_session(
+                interaction_id=new_interaction_id,
+                query=session.query,
+                title=session.title or session.query[:60],
+                format_instructions=session.format_instructions,
+                agent_name=agent_name,
+                status=ResearchStatus.EXECUTING,
+                plan_text=session.plan_text,
+            )
+        except Exception as save_error:
+            logger.warning("⚠️ Failed to save executing session: %s", save_error)
+
+        return await _poll_deep_research_to_completion(
+            interaction_id=new_interaction_id,
+            effective_query=session.query,
+            start=start,
+            text_parts=text_parts,
+            image_events=image_events,
+            session_saved=True,
+            ctx=ctx,
+        )
+    except DeepResearchError:
+        raise
+    except Exception as e:
+        logger.exception("refine_research_plan failed: %s", e)
+        raise DeepResearchError(code="INTERNAL_ERROR", message=str(e)) from e
+
+
+# =============================================================================
 # list_format_templates: Show available format instruction templates
 # =============================================================================
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True))
 async def list_format_templates(
     category: Annotated[
         str | None,
@@ -1059,7 +1599,7 @@ async def list_format_templates(
     }, indent=2)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 async def research_followup(
     query: Annotated[
         str, "Follow-up question about previous research (e.g., 'elaborate on surface codes')"
@@ -1069,8 +1609,8 @@ async def research_followup(
         "Optional: specific interaction_id. If not provided, auto-matches from sessions.",
     ] = None,
     model: Annotated[
-        str, "Model to use for follow-up. Default: gemini-3.1-pro-preview"
-    ] = "gemini-3.1-pro-preview",
+        str | None, "Model to use for follow-up. Defaults to the configured GEMINI_MODEL."
+    ] = None,
 ) -> str:
     """
     Continue conversation after deep research. Ask follow-up questions without restarting.
@@ -1084,7 +1624,7 @@ async def research_followup(
     Args:
         query: Your follow-up question
         interaction_id: Optional specific session ID (from list_research_sessions)
-        model: Model to use (default: gemini-3.1-pro-preview)
+        model: Model to use (default: configured GEMINI_MODEL / gemini-3.7-flash)
 
     Returns:
         Response to the follow-up question
@@ -1161,7 +1701,7 @@ async def research_followup(
         return f"❌ Follow-up failed: {e}"
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True))
 async def list_research_sessions(
     limit: Annotated[int, "Maximum number of sessions to return"] = 20,
     include_expired: Annotated[bool, "Include expired sessions"] = False,
@@ -1222,7 +1762,7 @@ async def list_research_sessions(
     )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 async def resume_research(
     interaction_id: Annotated[
         str | None,
@@ -1260,29 +1800,67 @@ async def resume_research(
     try:
         # If no interaction_id, list all resumable sessions
         if not interaction_id:
-            resumable = list_resumable_sessions(limit=10)
-            if not resumable:
+            sessions = _list_sessions(limit=50, include_expired=False)
+            now = time.time()
+            resumable = [s for s in sessions if s.is_resumable]
+            recent_resumable = [
+                s for s in resumable if now - s.created_at <= STALE_RESUMABLE_SECONDS
+            ][:10]
+            stale_resumable = [
+                s for s in resumable if now - s.created_at > STALE_RESUMABLE_SECONDS
+            ][:10]
+            recent_failed = [
+                s
+                for s in sessions
+                if s.status == ResearchStatus.FAILED
+                and now - s.created_at <= RECENT_FAILED_SECONDS
+            ][:10]
+
+            if not recent_resumable and not stale_resumable and not recent_failed:
                 return json.dumps({
                     "status": "no_resumable_sessions",
                     "message": "No interrupted or in-progress research sessions found.",
-                    "hint": "All sessions are either completed or expired.",
+                    "hint": (
+                        "All sessions are completed/expired, or the failed run used a "
+                        "different GEMINI_RESEARCH_STORAGE_PATH or MCP runtime."
+                    ),
                 })
 
-            session_list = []
-            for s in resumable:
-                session_list.append({
-                    "interaction_id": s.interaction_id,
-                    "query": s.query[:100],
-                    "status": s.status.value,
-                    "created_at": s.created_at_iso,
-                    "expires_in": s.time_remaining_human,
-                })
+            def summarize_session(session: ResearchSession) -> dict[str, str | float | bool]:
+                age_hours = (now - session.created_at) / 3600
+                return {
+                    "interaction_id": session.interaction_id,
+                    "query": session.query[:100],
+                    "status": session.status.value,
+                    "created_at": session.created_at_iso,
+                    "expires_in": session.time_remaining_human or "unknown",
+                    "age_hours": round(age_hours, 1),
+                    "stale": age_hours > 24,
+                }
 
             return json.dumps({
-                "status": "resumable_sessions_found",
-                "count": len(session_list),
-                "sessions": session_list,
-                "hint": "Call resume_research with a specific interaction_id to check/resume.",
+                "status": (
+                    "resumable_sessions_found"
+                    if recent_resumable
+                    else (
+                        "recent_failed_sessions_found"
+                        if recent_failed
+                        else "stale_resumable_sessions_found"
+                    )
+                ),
+                "count": len(recent_resumable),
+                "sessions": [summarize_session(s) for s in recent_resumable],
+                "stale_count": len(stale_resumable),
+                "stale_sessions": [summarize_session(s) for s in stale_resumable],
+                "recent_failed_count": len(recent_failed),
+                "recent_failed_sessions": [
+                    summarize_session(s) for s in recent_failed
+                ],
+                "hint": (
+                    "Call resume_research with a specific interaction_id. "
+                    "Recent failed sessions are included because retryable gateway "
+                    "timeouts can be misclassified by older server versions."
+                ),
             }, indent=2)
 
         # Check specific session status
@@ -1295,13 +1873,18 @@ async def resume_research(
 
         # If already completed, return the report
         if session.status == ResearchStatus.COMPLETED:
-            return json.dumps({
-                "status": "already_completed",
-                "message": "This research session is already completed.",
-                "title": session.title,
-                "summary": session.summary,
-                "hint": "Use research_followup or export_research_session.",
-            })
+            if (session.report_text or "").strip():
+                return json.dumps({
+                    "status": "already_completed",
+                    "message": "This research session is already completed.",
+                    "title": session.title,
+                    "summary": session.summary,
+                    "hint": "Use research_followup or export_research_session.",
+                })
+            logger.info(
+                "Completed session %s has no stored report; checking Gemini status",
+                interaction_id[:12],
+            )
 
         # If already cancelled, don't re-query — it's terminal
         if session.status == ResearchStatus.CANCELLED:
@@ -1330,6 +1913,28 @@ async def resume_research(
                 total_tokens = None
                 if result.usage and result.usage.total_tokens:
                     total_tokens = result.usage.total_tokens
+
+                if not (result.text or "").strip():
+                    update_research_session(
+                        interaction_id,
+                        total_tokens=total_tokens,
+                        status=ResearchStatus.INTERRUPTED,
+                    )
+                    return json.dumps({
+                        "status": "completed_without_report",
+                        "message": (
+                            "Gemini reports this interaction completed, but no report text "
+                            "was returned. The session remains marked interrupted so it "
+                            "stays visible for recovery checks."
+                        ),
+                        "resumable": True,
+                        "query": session.query[:100],
+                        "interaction_id": interaction_id,
+                        "hint": (
+                            "Try resume_research again later. If the report remains empty, "
+                            "start a new research_deep_max run."
+                        ),
+                    }, indent=2)
 
                 # Generate metadata
                 metadata = await generate_session_metadata(
@@ -1437,7 +2042,7 @@ async def resume_research(
         return json.dumps({"error": f"Resume failed: {e}"})
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True))
 async def export_research_session(
     interaction_id: Annotated[
         str | None,
@@ -1619,26 +2224,30 @@ async def export_research_session(
         else:
             result = export_session(session, format, output_path=resolved_path)
 
+        # Persist every export so research://exports/{id} survives process restarts
+        # and is shared by workers when the Redis backend is configured.
+        export_id = await _cache_export(result, session.interaction_id)
+
         # Return EmbeddedResource for all formats to enable VS Code "Save As" button
         # Following the ElevenLabs MCP pattern: put filename in URI for browser-like save dialog
         import base64
 
         # URI contains filename so clients extract it for "Save As" dialog (like browsers)
-        resource_uri = f"research://{result.filename}"
+        resource_uri = f"research://exports/{export_id}"
 
         # For text formats (MD, JSON), use TextResourceContents
         # For binary formats (DOCX), use BlobResourceContents
         if result.format == ExportFormat.DOCX:
             resource_content: BlobResourceContents | TextResourceContents = BlobResourceContents(
-                uri=AnyUrl(resource_uri),
-                mimeType=result.mime_type,
+                uri=resource_uri,
+                mime_type=result.mime_type,
                 blob=base64.b64encode(result.content).decode("ascii"),
             )
         else:
             # Text formats - use TextResourceContents
             resource_content = TextResourceContents(
-                uri=AnyUrl(resource_uri),
-                mimeType=result.mime_type,
+                uri=resource_uri,
+                mime_type=result.mime_type,
                 text=result.content.decode("utf-8"),
             )
 
@@ -1736,7 +2345,7 @@ def get_research_models() -> str:
 
 ## Follow-up (research_followup)
 
-**Model:** Configurable (default: gemini-3.1-pro-preview)
+**Model:** Configurable (default: gemini-3.7-flash)
 - **Latency:** 5-30 seconds
 - **API:** Gemini Interactions API
 - **Best for:** Clarification, elaboration, summarization of prior research
@@ -1749,7 +2358,7 @@ def get_research_models() -> str:
     name="Research Export",
     description="Download an exported research report. Use export_research_session tool first.",
 )
-def get_export_by_id(export_id: str) -> BlobResourceContents | TextResourceContents:
+async def get_export_by_id(export_id: str) -> BlobResourceContents | TextResourceContents:
     """
     Retrieve an exported research report by its export ID.
 
@@ -1768,30 +2377,28 @@ def get_export_by_id(export_id: str) -> BlobResourceContents | TextResourceConte
     """
     import base64
 
-    from pydantic import AnyUrl
-
-    entry = _get_cached_export(export_id)
+    entry = await _get_cached_export(export_id)
     if not entry:
         raise ValueError(f"Export not found or expired: {export_id}")
 
-    logger.info("📥 Serving export %s (%s)", export_id, entry.result.filename)
+    logger.info("📥 Serving export %s (%s)", export_id, entry.filename)
 
-    uri = AnyUrl(f"research://exports/{export_id}")
-    mime_type = entry.result.mime_type
+    uri = f"research://exports/{export_id}"
+    mime_type = entry.mime_type
 
     # For text formats, return TextResourceContents
     if mime_type in ("text/markdown", "application/json"):
         return TextResourceContents(
             uri=uri,
-            mimeType=mime_type,
-            text=entry.result.content.decode("utf-8"),
+            mime_type=mime_type,
+            text=entry.content.decode("utf-8"),
         )
 
     # For binary formats (DOCX), return BlobResourceContents with base64
     return BlobResourceContents(
         uri=uri,
-        mimeType=mime_type,
-        blob=base64.b64encode(entry.result.content).decode("ascii"),
+        mime_type=mime_type,
+        blob=base64.b64encode(entry.content).decode("ascii"),
     )
 
 
@@ -1801,30 +2408,27 @@ def get_export_by_id(export_id: str) -> BlobResourceContents | TextResourceConte
     description="List all currently cached exports ready for download.",
     mime_type="application/json",
 )
-def list_exports() -> str:
+async def list_exports() -> str:
     """
-    List all currently cached exports.
+    List all currently available exports.
 
     Returns a JSON array of available exports with their metadata.
-    Exports expire after 1 hour.
+    Exports expire after 1 hour (backend-enforced TTL).
     """
-    # Clean up expired entries first
-    expired_keys = [k for k, v in _export_cache.items() if v.is_expired]
-    for key in expired_keys:
-        del _export_cache[key]
+    artifacts: list[ExportArtifact] = await get_export_store().list_async()
 
     exports = []
-    for export_id, entry in _export_cache.items():
-        remaining = (entry.created_at + timedelta(seconds=EXPORT_TTL_SECONDS)) - datetime.now(UTC)
+    for entry in artifacts:
+        remaining = (entry.created_at + EXPORT_TTL_SECONDS) - time.time()
         exports.append({
-            "export_id": export_id,
-            "uri": f"research://exports/{export_id}",
-            "filename": entry.result.filename,
-            "format": entry.result.format.value,
-            "size": entry.result.size_human,
-            "mime_type": entry.result.mime_type,
+            "export_id": entry.export_id,
+            "uri": f"research://exports/{entry.export_id}",
+            "filename": entry.filename,
+            "format": entry.format,
+            "size": entry.size_human,
+            "mime_type": entry.mime_type,
             "session_id": entry.session_id[:12] + "...",
-            "expires_in": f"{max(0, int(remaining.total_seconds()))}s",
+            "expires_in": f"{max(0, int(remaining))}s",
         })
 
     return json.dumps({"exports": exports, "count": len(exports)}, indent=2)
@@ -1835,8 +2439,38 @@ def list_exports() -> str:
 # =============================================================================
 
 
+# =============================================================================
+# Transport Configuration (dual transport: stdio default, opt-in streamable-http)
+# =============================================================================
+
+# Hosts considered local-only. 0.0.0.0/:: bind all interfaces and are NOT
+# loopback - they require explicit authentication before the server will start.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True if `host` only accepts connections from the local machine."""
+    return host in _LOOPBACK_HOSTS
+
+
+def _require_auth_for_non_loopback(*, host: str, has_auth: bool) -> None:
+    """Refuse to start streamable-http on a non-loopback host without auth.
+
+    A remote, unauthenticated HTTP endpoint would let anyone consume the
+    server owner's Gemini API quota. Fail closed rather than silently
+    exposing the server.
+    """
+    if not _is_loopback_host(host) and not has_auth:
+        raise SystemExit(
+            f"Refusing to bind streamable-http to non-loopback host {host!r} without "
+            "authentication configured. Set GEMINI_RESEARCH_HTTP_BEARER_TOKEN (or "
+            "assign a custom fastmcp AuthProvider to `mcp.auth`) before exposing this "
+            "server beyond localhost, or bind to 127.0.0.1/localhost for local-only access."
+        )
+
+
 def main() -> None:
-    """Run the MCP server on stdio transport."""
+    """Run the MCP server on stdio (default) or opt-in streamable-http transport."""
     import argparse
     import os
 
@@ -1848,6 +2482,39 @@ def main() -> None:
         "--api-key",
         metavar="KEY",
         help="Gemini API key (or set GEMINI_API_KEY environment variable)",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default=os.environ.get("GEMINI_RESEARCH_TRANSPORT", "stdio"),
+        help=(
+            "Transport protocol (default: stdio, the historical VS Code/Claude "
+            "Desktop config). streamable-http is opt-in, for remote/multi-worker "
+            "deployments (env: GEMINI_RESEARCH_TRANSPORT)."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("GEMINI_RESEARCH_HTTP_HOST", "127.0.0.1"),
+        help=(
+            "Host to bind for streamable-http transport. Defaults to 127.0.0.1 "
+            "(loopback-only). Binding elsewhere requires authentication "
+            "(env: GEMINI_RESEARCH_HTTP_HOST)."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("GEMINI_RESEARCH_HTTP_PORT", "8000")),
+        help="Port for streamable-http transport (default: 8000, env: GEMINI_RESEARCH_HTTP_PORT)",
+    )
+    parser.add_argument(
+        "--path",
+        default=os.environ.get("GEMINI_RESEARCH_HTTP_PATH", "/mcp"),
+        help=(
+            "URL path for streamable-http transport (default: /mcp, "
+            "env: GEMINI_RESEARCH_HTTP_PATH)"
+        ),
     )
     parser.add_argument(
         "--version",
@@ -1862,10 +2529,41 @@ def main() -> None:
         os.environ["GEMINI_API_KEY"] = args.api_key
 
     logger.info("🚀 Starting Gemini Research MCP Server v%s (MCP SDK)", __version__)
-    logger.info("   Transport: stdio")
-    logger.info("   Task mode: optional (MCP Tasks / SEP-1732 when client supports it)")
+    logger.info("   Task mode: enabled (MCP Tasks / SEP-1732)")
 
-    mcp.run(transport="stdio")
+    if args.transport == "stdio":
+        logger.info("   Transport: stdio")
+        mcp.run(transport="stdio")
+        return
+
+    # GEMINI_API_KEY must never double as an MCP client credential - it is a
+    # provider secret, not an access-control token for this server's clients.
+    bearer_token = os.environ.get("GEMINI_RESEARCH_HTTP_BEARER_TOKEN")
+    if bearer_token:
+        from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+        # FastMCP's documented static-token verifier: a simple shared-secret
+        # bearer check suitable for a single trusted client/deployment. For
+        # multi-user or production-grade auth, assign a full AuthProvider
+        # (OAuthProvider/JWTVerifier/etc.) to `mcp.auth` instead.
+        mcp.auth = StaticTokenVerifier(
+            tokens={bearer_token: {"client_id": "gemini-research-mcp-client", "scopes": []}}
+        )
+
+    _require_auth_for_non_loopback(host=args.host, has_auth=mcp.auth is not None)
+
+    logger.info("   Transport: streamable-http (http://%s:%s%s)", args.host, args.port, args.path)
+    logger.info("   Auth: %s", "bearer token required" if mcp.auth else "none (loopback-only)")
+
+    # stateless_http=True: no sticky sessions, matching the sessionless
+    # protocol era and the guard-pattern elicitation design used above.
+    mcp.run(
+        transport="streamable-http",
+        host=args.host,
+        port=args.port,
+        path=args.path,
+        stateless_http=True,
+    )
 
 
 # Export for use as module

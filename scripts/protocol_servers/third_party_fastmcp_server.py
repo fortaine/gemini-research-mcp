@@ -1,18 +1,19 @@
 import asyncio
 
 from fastmcp import Context, FastMCP
-from fastmcp.server.tasks.config import TaskConfig
+from fastmcp.utilities.tasks import TaskConfig
+from fastmcp_tasks import TasksExtension
 from mcp.types import ToolAnnotations
-
 
 mcp = FastMCP(
     name="Protocol Test (third-party fastmcp)",
     instructions="Protocol-only test server.",
 )
+mcp.add_extension(TasksExtension())
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True),
     task=TaskConfig(mode="optional"),
 )
 async def progress_demo(

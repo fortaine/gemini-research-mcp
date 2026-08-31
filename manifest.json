@@ -2,9 +2,9 @@
   "manifest_version": "0.4",
   "name": "gemini-research-mcp",
   "display_name": "Gemini Research",
-  "version": "0.13.0",
-  "description": "AI-powered research using Gemini with FastMCP 3.1 BM25 tool search and Deep Research",
-  "long_description": "MCP server providing AI-powered research capabilities using Google Gemini with a FastMCP 3.1 BM25 tool-search surface:\n\n- **research_web**: Fast web research with Gemini grounding (5-30 seconds)\n- **research_deep**: Comprehensive autonomous research agent (3-20 minutes)\n- **search_tools**: Discover utility tools for URL reading, templates, sessions, follow-up, resume, and export\n- **call_tool**: Execute a discovered utility tool by name\n\nUtility tools remain directly callable for clients that already know the tool name.",
+  "version": "0.16.0-beta.1",
+  "description": "AI-powered research using Gemini 3.7 and FastMCP 4 with compact tool search and recoverable Deep Research",
+  "long_description": "MCP server providing AI-powered research capabilities using Google Gemini 3.7 and FastMCP 4.0.0b5:\n\n- **research_web**: Fast web research with Gemini grounding (5-30 seconds)\n- **research_deep**: Autonomous research with recoverable session storage and modern steps/output_text report extraction\n- **research_deep_max**: Maximum-comprehensiveness research with visualization and collaborative planning\n- **search_tools** / **call_tool**: Compact BM25 discovery and invocation of utility tools\n- **resume_research** / **export_research_session**: Recover sessions and persist Markdown, JSON, or DOCX artifacts\n\nThe server supports stdio and guarded streamable HTTP transports plus shared Disk/Redis storage.",
   "author": {
     "name": "Guillaume Fortaine",
     "email": "guillaume.fortaine+github@machinemates.ai",
@@ -22,7 +22,12 @@
     "entry_point": "src/gemini_research_mcp/server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "--directory", "{{install_path}}", "gemini-research-mcp"],
+      "args": [
+        "run",
+        "--directory",
+        "{{install_path}}",
+        "gemini-research-mcp"
+      ],
       "env": {
         "GEMINI_API_KEY": "{{user_config.gemini_api_key}}"
       }
@@ -31,19 +36,55 @@
   "tools": [
     {
       "name": "research_web",
-      "description": "Fast web research with Gemini grounding (5-30 seconds). Use for fact-checking, current events, documentation."
+      "description": "Fast web research with Gemini grounding (5-30 seconds). Use for fact-checking, current events, and documentation."
     },
     {
       "name": "research_deep",
-      "description": "Comprehensive autonomous research agent (3-20 minutes). Use for research reports, competitive analysis, investigations."
+      "description": "Default Deep Research agent with task progress, recovery, optional visualization, and collaborative planning."
+    },
+    {
+      "name": "research_deep_max",
+      "description": "Maximum-comprehensiveness Deep Research for exhaustive, high-stakes, due-diligence, market-map, literature-review, and offline workflows."
+    },
+    {
+      "name": "resume_research",
+      "description": "Recover interrupted or in-progress research sessions."
+    },
+    {
+      "name": "export_research_session",
+      "description": "Export completed research to persistent Markdown, JSON, or Word (DOCX) artifacts and disk files."
     },
     {
       "name": "search_tools",
-      "description": "Search the server's utility tools with a natural-language query and return full tool definitions."
+      "description": "Search the server utility catalog with a natural-language query and return full tool definitions."
     },
     {
       "name": "call_tool",
       "description": "Execute a utility tool discovered through search_tools by providing its name and arguments."
+    },
+    {
+      "name": "fetch_webpage",
+      "description": "Read and extract clean Markdown content from a specific public URL."
+    },
+    {
+      "name": "research_followup",
+      "description": "Continue conversation with a previous deep research session."
+    },
+    {
+      "name": "list_research_sessions",
+      "description": "List previous research sessions with queries and summaries."
+    },
+    {
+      "name": "list_format_templates",
+      "description": "Browse reusable report format templates for research outputs."
+    },
+    {
+      "name": "refine_research_plan",
+      "description": "Iterate on or approve a collaborative-planning Deep Research session."
+    },
+    {
+      "name": "inspect_mcp_server_for_gemini",
+      "description": "Inspect a remote MCP server for Gemini schema and allowed-tools compatibility."
     }
   ],
   "user_config": {
@@ -56,7 +97,11 @@
     }
   },
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "python": ">=3.12"
     }
@@ -68,7 +113,9 @@
     "ai",
     "deep-research",
     "grounding",
-    "google-search"
+    "google-search",
+    "deep-research-max",
+    "fastmcp"
   ],
   "license": "MIT"
 }

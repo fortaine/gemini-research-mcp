@@ -88,6 +88,7 @@ class TestMCPToolRegistration:
         expected_tools = {
             "research_web",
             "research_deep",
+            "research_deep_max",
             "resume_research",
             "export_research_session",
             "search_tools",
@@ -103,7 +104,7 @@ class TestMCPToolRegistration:
         from gemini_research_mcp.server import mcp
 
         tools = await mcp.list_tools()
-        assert len(tools) == 6, f"Expected 6 tools, got {len(tools)}"
+        assert len(tools) == 7, f"Expected 7 tools, got {len(tools)}"
 
     @pytest.mark.asyncio
     async def test_tools_have_descriptions(self):
@@ -129,6 +130,7 @@ class TestToolSearchOverStdio:
         assert tool_names == {
             "research_web",
             "research_deep",
+            "research_deep_max",
             "resume_research",
             "export_research_session",
             "search_tools",
@@ -140,10 +142,10 @@ class TestToolSearchOverStdio:
         async with _gemini_stdio_session() as session:
             result = await session.call_tool("search_tools", {"query": "fetch webpage"})
 
-        assert result.isError is False
-        assert result.structuredContent is not None
+        assert result.is_error is False
+        assert result.structured_content is not None
 
-        matches = result.structuredContent["result"]
+        matches = result.structured_content["result"]
         fetch_tool = next(tool for tool in matches if tool["name"] == "fetch_webpage")
 
         assert "url" in fetch_tool["inputSchema"]["properties"]
@@ -156,10 +158,10 @@ class TestToolSearchOverStdio:
                 {"name": "list_format_templates", "arguments": {}},
             )
 
-        assert result.isError is False
-        assert result.structuredContent is not None
+        assert result.is_error is False
+        assert result.structured_content is not None
 
-        payload = json.loads(result.structuredContent["result"])
+        payload = json.loads(result.structured_content["result"])
 
         assert payload["count"] > 0
         assert any(template["key"] == "executive_briefing" for template in payload["templates"])
@@ -169,10 +171,10 @@ class TestToolSearchOverStdio:
         async with _gemini_stdio_session() as session:
             result = await session.call_tool("list_format_templates", {})
 
-        assert result.isError is False
-        assert result.structuredContent is not None
+        assert result.is_error is False
+        assert result.structured_content is not None
 
-        payload = json.loads(result.structuredContent["result"])
+        payload = json.loads(result.structured_content["result"])
 
         assert payload["count"] > 0
 
@@ -204,7 +206,7 @@ class TestMCPLifespan:
 
     def test_task_config_on_research_deep(self):
         """research_deep tool should have TaskConfig(mode='required')."""
-        from fastmcp.server.tasks.config import TaskConfig
+        from fastmcp.utilities.tasks import TaskConfig
 
         # Verify TaskConfig is importable and usable
         config = TaskConfig(mode="required")
@@ -288,7 +290,7 @@ class TestMCPTypesCompatibility:
 
     def test_task_config_import(self):
         """TaskConfig should be importable from fastmcp."""
-        from fastmcp.server.tasks.config import TaskConfig
+        from fastmcp.utilities.tasks import TaskConfig
 
         assert TaskConfig is not None
 

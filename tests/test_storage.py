@@ -416,3 +416,110 @@ class TestConfiguration:
         monkeypatch.setenv("GEMINI_RESEARCH_TTL_SECONDS", "3600")
         ttl = get_ttl_seconds()
         assert ttl == 3600
+
+
+# =============================================================================
+# Storage Backend Selection Tests (GEMINI_RESEARCH_STORAGE_URL)
+# =============================================================================
+
+
+class TestBackendSelection:
+    """Tests for create_store()'s local-disk vs shared-Redis backend selection."""
+
+    def test_no_url_selects_disk_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without GEMINI_RESEARCH_STORAGE_URL, the local disk backend is used."""
+        from key_value.aio.stores.disk import DiskStore
+
+        from gemini_research_mcp.storage import create_store
+
+        monkeypatch.delenv("GEMINI_RESEARCH_STORAGE_URL", raising=False)
+        store = create_store(storage_dir=tmp_path)
+        assert isinstance(store, DiskStore)
+
+    def test_url_selects_redis_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Setting GEMINI_RESEARCH_STORAGE_URL switches to the shared Redis backend.
+
+        RedisStore's constructor is lazy (no eager connection attempt), so this
+        can be verified without a running Redis server.
+        """
+        from key_value.aio.stores.redis.store import RedisStore
+
+        from gemini_research_mcp.storage import create_store
+
+        monkeypatch.setenv("GEMINI_RESEARCH_STORAGE_URL", "redis://localhost:6379/0")
+        store = create_store()
+        assert isinstance(store, RedisStore)
+
+    def test_get_storage_backend_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """get_storage_backend_url reflects the env var, None when unset/empty."""
+        from gemini_research_mcp.storage import get_storage_backend_url
+
+        monkeypatch.delenv("GEMINI_RESEARCH_STORAGE_URL", raising=False)
+        assert get_storage_backend_url() is None
+
+        monkeypatch.setenv("GEMINI_RESEARCH_STORAGE_URL", "redis://localhost:6379/0")
+        assert get_storage_backend_url() == "redis://localhost:6379/0"
+
+        monkeypatch.setenv("GEMINI_RESEARCH_STORAGE_URL", "")
+        assert get_storage_backend_url() is None
+
+
+# =============================================================================
+# Cross-Instance Sharing Tests (multi-worker / stateless deployment proof)
+# =============================================================================
+
+
+class TestCrossInstanceSharing:
+    """Prove a session created by one SessionStorage instance is readable by another.
+
+    This is the acceptance criterion from the stateless-storage modernization
+    plan: "A research session started on one instance is resumable from
+    another with a shared backend." Using two instances pointed at the same
+    disk directory exercises the same code path a Redis-shared deployment
+    would use (the abstraction doesn't distinguish instances, only backends).
+    """
+
+    @pytest.mark.asyncio
+    async def test_session_created_by_a_is_readable_by_b(
+        self, tmp_path: Path, sample_session: ResearchSession
+    ) -> None:
+        storage_a = SessionStorage(storage_dir=tmp_path)
+        await storage_a.save_session_async(sample_session)
+
+        storage_b = SessionStorage(storage_dir=tmp_path)
+        retrieved = await storage_b.get_session_async(sample_session.interaction_id)
+
+        assert retrieved is not None
+        assert retrieved.interaction_id == sample_session.interaction_id
+
+    @pytest.mark.asyncio
+    async def test_session_list_visible_across_instances(self, tmp_path: Path) -> None:
+        storage_a = SessionStorage(storage_dir=tmp_path)
+        for i in range(3):
+            await storage_a.save_session_async(
+                ResearchSession(
+                    interaction_id=f"shared-{i}",
+                    query=f"Query {i}",
+                    created_at=time.time(),
+                )
+            )
+
+        storage_b = SessionStorage(storage_dir=tmp_path)
+        sessions = await storage_b.list_sessions_async()
+        assert len(sessions) == 3
+
+    @pytest.mark.asyncio
+    async def test_update_by_b_is_visible_to_a(
+        self, tmp_path: Path, sample_session: ResearchSession
+    ) -> None:
+        storage_a = SessionStorage(storage_dir=tmp_path)
+        await storage_a.save_session_async(sample_session)
+
+        storage_b = SessionStorage(storage_dir=tmp_path)
+        await storage_b.update_session_async(sample_session.interaction_id, notes="from B")
+
+        refreshed = await storage_a.get_session_async(sample_session.interaction_id)
+        assert refreshed is not None
+        assert refreshed.notes == "from B"

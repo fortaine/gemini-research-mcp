@@ -18,6 +18,7 @@ class TestToolSearchTransform:
         assert tool_names == {
             "research_web",
             "research_deep",
+            "research_deep_max",
             "resume_research",
             "export_research_session",
             "search_tools",
