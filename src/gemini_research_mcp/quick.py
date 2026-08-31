@@ -76,33 +76,33 @@ def _extract_sources_from_text(text: str) -> list[Source]:
 
 
 def _extract_sources(response: GenerateContentResponse) -> tuple[list[Source], list[str]]:
-    """Extract sources and queries from grounding metadata."""
+    """Extract sources and queries from grounding metadata.
+
+    Falls back to parsing URLs out of the response text whenever grounding
+    metadata is absent or empty - e.g. when the model answers from its own
+    knowledge without invoking the google_search tool at all.
+    """
     sources: list[Source] = []
     queries: list[str] = []
 
-    if not response.candidates:
-        return sources, queries
+    candidate = response.candidates[0] if response.candidates else None
+    gm = candidate.grounding_metadata if candidate else None
 
-    candidate = response.candidates[0]
-    if not candidate.grounding_metadata:
-        return sources, queries
+    if gm:
+        # Extract search queries used
+        if gm.web_search_queries:
+            queries = list(gm.web_search_queries)
 
-    gm = candidate.grounding_metadata
-
-    # Extract search queries used
-    if gm.web_search_queries:
-        queries = list(gm.web_search_queries)
-
-    # Extract sources from grounding chunks
-    if gm.grounding_chunks:
-        for chunk in gm.grounding_chunks:
-            if hasattr(chunk, "web") and chunk.web:
-                sources.append(
-                    Source(
-                        uri=chunk.web.uri or "",
-                        title=chunk.web.title or "",
+        # Extract sources from grounding chunks
+        if gm.grounding_chunks:
+            for chunk in gm.grounding_chunks:
+                if hasattr(chunk, "web") and chunk.web:
+                    sources.append(
+                        Source(
+                            uri=chunk.web.uri or "",
+                            title=chunk.web.title or "",
+                        )
                     )
-                )
 
     if not sources and response.text:
         sources = _extract_sources_from_text(response.text)
