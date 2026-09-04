@@ -1629,7 +1629,7 @@ async def research_followup(
     Args:
         query: Your follow-up question
         interaction_id: Optional specific session ID (from list_research_sessions)
-        model: Model to use (default: configured GEMINI_MODEL / gemini-3.7-flash)
+        model: Model to use (default: configured GEMINI_MODEL / gemini-3.8-flash)
 
     Returns:
         Response to the follow-up question
@@ -2350,7 +2350,7 @@ def get_research_models() -> str:
 
 ## Follow-up (research_followup)
 
-**Model:** Configurable (default: gemini-3.7-flash)
+**Model:** Configurable (default: gemini-3.8-flash)
 - **Latency:** 5-30 seconds
 - **API:** Gemini Interactions API
 - **Best for:** Clarification, elaboration, summarization of prior research

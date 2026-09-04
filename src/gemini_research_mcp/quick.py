@@ -126,7 +126,7 @@ async def quick_research(
 
     Args:
         query: Research question or topic
-        model: Gemini model (default: configured GEMINI_MODEL / gemini-3.7-flash)
+        model: Gemini model (default: configured GEMINI_MODEL / gemini-3.8-flash)
         thinking_level: Accepted for backward compatibility but ignored; quick research
             always uses high thinking
         system_instruction: Optional system prompt
@@ -238,7 +238,7 @@ Generate:
 
     config = GenerateContentConfig(
         thinking_config=ThinkingConfig(
-            thinking_level=ThinkingLevel.LOW,  # gemini-3.7-flash does not document "minimal"
+            thinking_level=ThinkingLevel.LOW,  # low thinking keeps helper calls concise
         ),
         response_mime_type="application/json",
         response_schema=SessionMetadata,
@@ -316,7 +316,7 @@ Generate a title (max {max_chars} chars) that captures the main topic.
 
     config = GenerateContentConfig(
         thinking_config=ThinkingConfig(
-            thinking_level=ThinkingLevel.LOW,  # gemini-3.7-flash does not document "minimal"
+            thinking_level=ThinkingLevel.LOW,  # low thinking keeps helper calls concise
         ),
         response_mime_type="application/json",
         response_schema=TitleOnly,
@@ -389,7 +389,7 @@ If none of the sessions match the user's question, return exactly: NONE"""
 
     config = GenerateContentConfig(
         thinking_config=ThinkingConfig(
-            thinking_level=ThinkingLevel.LOW,  # gemini-3.7-flash does not document "minimal"
+            thinking_level=ThinkingLevel.LOW,  # low thinking keeps helper calls concise
         ),
     )
 
