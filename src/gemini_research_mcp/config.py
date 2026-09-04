@@ -31,16 +31,15 @@ DOCKET_URL_ENV_VAR = "FASTMCP_DOCKET_URL"
 # =============================================================================
 
 # Default models - can be overridden via environment
-DEFAULT_MODEL = "gemini-3.7-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 # Interactions Deep Research agent used by research_deep by default.
 DEFAULT_DEEP_RESEARCH_AGENT = DeepResearchAgent.DEEP_RESEARCH
 # Model for generating summaries (fast, cheap)
-DEFAULT_SUMMARY_MODEL = "gemini-3.7-flash"
+DEFAULT_SUMMARY_MODEL = "gemini-3.8-flash"
 
 # Thinking level for Gemini 3 models
 # Values: "minimal", "low", "medium", "high"
-# - minimal: minimize latency for chat/high-throughput (gemini-3.1-* only;
-#   gemini-3.7-flash does not document "minimal", use "low" instead)
+# - minimal: minimize latency for chat/high-throughput
 # - low: balance speed and quality
 # - medium: good reasoning depth
 # - high: maximum reasoning depth (recommended for research)

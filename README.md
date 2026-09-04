@@ -8,7 +8,7 @@
 MCP server for AI-powered research using **Gemini**. Fast grounded search, URL extraction, comprehensive Deep Research, and session management.
 
 Built on **FastMCP `4.0.0b5`** (beta, exact-pinned) with the modern sessionless
-MCP protocol, **Gemini `3.7 Flash`**, MCP Tasks (SEP-1732), the guard-pattern
+MCP protocol, **Gemini `3.8 Flash`**, MCP Tasks (SEP-1732), the guard-pattern
 elicitation flow, a BM25-compacted tool catalog, and pluggable Disk/Redis
 storage with a zero-configuration local default.
 
@@ -186,8 +186,8 @@ The bundle uses UV runtime - dependencies are installed automatically, no Python
 | Variable | Required | Default | Description |
 |----------|----------|---------|--------------|
 | `GEMINI_API_KEY` | **Yes** | — | [Google AI Studio API key](https://aistudio.google.com/apikey) |
-| `GEMINI_MODEL` | No | `gemini-3.7-flash` | Model for `research_web` |
-| `GEMINI_SUMMARY_MODEL` | No | `gemini-3.7-flash` | Model for session summaries, titles, and clarification (thinking level `low`) |
+| `GEMINI_MODEL` | No | `gemini-3.8-flash` | Model for `research_web` |
+| `GEMINI_SUMMARY_MODEL` | No | `gemini-3.8-flash` | Model for session summaries, titles, and clarification (thinking level `low`) |
 | `DEEP_RESEARCH_AGENT` | No | `deep-research-preview-04-2026` | Default agent for `research_deep`; accepts `fast`, `standard`, `deep-research`, `max`, `deep-research-max`, or exact agent IDs |
 | `FETCH_PROXY_URL` | No | — | Default HTTP(S) proxy for `fetch_webpage` |
 | `GEMINI_RESEARCH_STORAGE_URL` | No | — | `redis://...` URL to share sessions, exports, and (unless overridden) Tasks across multiple instances/workers. Local DiskStore + memory Tasks remain the default |
@@ -272,7 +272,7 @@ Gemini models while Deep Research uses Interactions agents.
 
 ### Remote MCP servers for Deep Research
 
-**Disabled in `v0.16.0b2`.** Any non-empty `mcp_servers` value is rejected for
+**Disabled since `v0.16.0b2`.** Any non-empty `mcp_servers` value is rejected for
 both `research_deep` and `research_deep_max` before remote inspection, network
 access, or Gemini API consumption.
 

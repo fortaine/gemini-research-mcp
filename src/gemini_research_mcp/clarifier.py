@@ -22,8 +22,8 @@ from gemini_research_mcp.config import LOGGER_NAME, get_api_key
 
 logger = logging.getLogger(LOGGER_NAME)
 
-# Fast model for clarification - Gemini 3.7 Flash for quick, intelligent responses
-CLARIFIER_MODEL = "gemini-3.7-flash"
+# Fast model for clarification - Gemini 3.8 Flash for quick, intelligent responses
+CLARIFIER_MODEL = "gemini-3.8-flash"
 
 # Maximum questions to avoid user fatigue (research shows 3-5 is optimal)
 MAX_QUESTIONS = 5
