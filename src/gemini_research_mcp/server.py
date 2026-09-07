@@ -4,7 +4,7 @@ Gemini Research MCP Server
 Provides AI-powered research tools via Gemini:
 - research_web: Fast grounded web search (5-30 seconds) - Gemini + Google Search
 - research_deep: Comprehensive multi-step research (3-20 minutes) - Deep Research Agent
-- research_followup: Ask follow-up questions about completed research
+- research_followup: Continue quick or Deep Research interactions
 
 Architecture:
 - FastMCP 4 with TasksExtension-based task support for background tasks (MCP Tasks / SEP-1732)
@@ -416,7 +416,8 @@ async def research_web(
     include_thoughts: Annotated[bool, "Include thinking summary in response"] = False,
 ) -> str:
     """
-    Fast web research with Gemini grounding. Returns answer with citations in seconds.
+    Fast web research with Gemini grounding. Returns answer, citations, and an
+    interaction ID usable with research_followup.
 
     Uses a fixed high thinking level for higher-quality grounded answers.
 
@@ -428,7 +429,7 @@ async def research_web(
         include_thoughts: Include thinking summary in response
 
     Returns:
-        Research results with sources as markdown text
+        Research results with sources and a follow-up interaction ID as markdown text
     """
     logger.info("🔎 research_web: %s", query[:100])
     start = time.time()
@@ -473,6 +474,8 @@ async def research_web(
                 f"*Completed in {_format_duration(elapsed)}*",
             ]
         )
+        if result.interaction_id:
+            lines.append(f"*Interaction ID: `{result.interaction_id}`*")
 
         return "\n".join(lines)
 
@@ -1611,24 +1614,31 @@ async def research_followup(
     ],
     interaction_id: Annotated[
         str | None,
-        "Optional: specific interaction_id. If not provided, auto-matches from sessions.",
+        (
+            "Optional interaction ID from research_web or research_deep. If omitted, "
+            "auto-matches persisted Deep Research sessions."
+        ),
     ] = None,
     model: Annotated[
         str | None, "Model to use for follow-up. Defaults to the configured GEMINI_MODEL."
     ] = None,
 ) -> str:
     """
-    Continue conversation after deep research. Ask follow-up questions without restarting.
+    Continue a previous research interaction from research_web or research_deep.
+    Ask follow-up questions without restarting and allow Gemini to search the web again.
 
-    The tool automatically finds the relevant research session based on your question.
-    You can optionally provide an interaction_id for direct reference.
+    When no interaction_id is provided, the tool automatically finds a matching
+    persisted Deep Research session based on your question. Pass the interaction
+    ID from research_web for a quick-research conversation, or use the ID returned
+    by an earlier follow-up to keep chaining the same interaction.
 
     Use for: "clarify", "elaborate", "summarize", "explain more", "what about",
     continue discussion, ask more questions about completed research results.
 
     Args:
         query: Your follow-up question
-        interaction_id: Optional specific session ID (from list_research_sessions)
+        interaction_id: Optional interaction ID returned by research_web,
+                        research_deep, or list_research_sessions
         model: Model to use (default: configured GEMINI_MODEL / gemini-3.8-flash)
 
     Returns:
@@ -1642,7 +1652,10 @@ async def research_followup(
         if not previous_interaction_id:
             sessions = _list_sessions(limit=20, include_expired=False)
             if not sessions:
-                return "❌ No research sessions found. Complete a deep research first."
+                return (
+                    "❌ No research sessions found. Start with research_web or "
+                    "research_deep first."
+                )
 
             # Filter out cancelled and failed sessions for auto-matching
             matchable = [
@@ -1684,11 +1697,18 @@ async def research_followup(
                     matchable[0].query[:50],
                 )
 
-        response = await _research_followup(
+        followup_result = await _research_followup(
             previous_interaction_id=previous_interaction_id,
             query=query,
             model=model,
+            include_interaction_id=True,
         )
+        if isinstance(followup_result, tuple):
+            response, next_interaction_id = followup_result
+            next_interaction_id = next_interaction_id or previous_interaction_id
+        else:
+            response = followup_result
+            next_interaction_id = previous_interaction_id
 
         lines = [
             "## Follow-up Response",
@@ -1696,7 +1716,7 @@ async def research_followup(
             response,
             "",
             "---",
-            f"*Interaction ID: `{previous_interaction_id}`*",
+            f"*Interaction ID: `{next_interaction_id}`*",
         ]
 
         return "\n".join(lines)
@@ -2354,7 +2374,7 @@ def get_research_models() -> str:
 - **Latency:** 5-30 seconds
 - **API:** Gemini Interactions API
 - **Best for:** Clarification, elaboration, summarization of prior research
-- **Requires:** `previous_interaction_id` from completed research
+- **Requires:** `previous_interaction_id` from `research_web` or `research_deep`
 """
 
 

@@ -62,22 +62,20 @@ class TestThinkingLevel:
         assert sources[0].uri == "https://docs.python.org/3/library/dataclasses.html"
 
     @pytest.mark.asyncio
-    async def test_quick_research_uses_fixed_high_thinking(
+    async def test_quick_research_uses_interactions_with_fixed_high_thinking(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """quick_research should always send HIGH thinking to Gemini."""
+        """quick_research should create a stateful interaction with high thinking."""
         captured: dict[str, object] = {}
 
-        async def fake_generate_content(*, model: str, contents: str, config: object) -> object:
-            captured["model"] = model
-            captured["contents"] = contents
-            captured["config"] = config
-            return types.SimpleNamespace(text="ok", candidates=[])
+        async def fake_create(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return types.SimpleNamespace(id="interaction-123", output_text="ok", steps=[])
 
         fake_client = types.SimpleNamespace(
             aio=types.SimpleNamespace(
-                models=types.SimpleNamespace(generate_content=fake_generate_content)
+                interactions=types.SimpleNamespace(create=fake_create)
             )
         )
 
@@ -90,8 +88,8 @@ class TestThinkingLevel:
 
         await quick_research("test query", thinking_level="minimal")
 
-        config = captured["config"]
-        assert config.thinking_config.thinking_level == ThinkingLevel.HIGH
+        assert captured["generation_config"] == {"thinking_level": "high"}
+        assert captured["tools"] == [{"type": "google_search"}]
 
     def test_default_is_high(self):
         """Default thinking level should be 'high'."""

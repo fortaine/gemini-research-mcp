@@ -191,12 +191,13 @@ class DeepResearchUsage:
 
 @dataclass(slots=True)
 class ResearchResult:
-    """Result from quick_research()."""
+    """Result from quick_research(), including an optional continuation ID."""
 
     text: str
     sources: list[Source] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
     thinking_summary: str | None = None
+    interaction_id: str | None = None
 
 
 @dataclass(slots=True)

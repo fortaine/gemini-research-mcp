@@ -130,6 +130,7 @@ class TestResearchResult:
         assert result.sources == []
         assert result.queries == []
         assert result.thinking_summary is None
+        assert result.interaction_id is None
 
     def test_construction_full(self):
         """ResearchResult should work with all args."""
@@ -139,10 +140,12 @@ class TestResearchResult:
             sources=sources,
             queries=["query 1", "query 2"],
             thinking_summary="I thought about it",
+            interaction_id="interaction-123",
         )
         assert len(result.sources) == 1
         assert len(result.queries) == 2
         assert result.thinking_summary == "I thought about it"
+        assert result.interaction_id == "interaction-123"
 
 
 class TestDeepResearchResult:
