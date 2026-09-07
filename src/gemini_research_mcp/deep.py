@@ -48,6 +48,8 @@ from gemini_research_mcp.types import (
 
 logger = logging.getLogger(LOGGER_NAME)
 
+GOOGLE_SEARCH_TOOL: dict[str, str] = {"type": "google_search"}
+
 _GEMINI_UNSUPPORTED_MCP_SCHEMA_KEYWORDS = frozenset({
     "$ref",
     "$defs",
@@ -230,6 +232,7 @@ def validate_mcp_servers_supported(
 
 def build_interactions_tools(
     *,
+    include_google_search: bool = False,
     file_search_store_names: list[str] | None = None,
     mcp_servers: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]] | None:
@@ -238,6 +241,8 @@ def build_interactions_tools(
         raise ValueError(REMOTE_MCP_DISABLED_MESSAGE)
 
     tools: list[dict[str, Any]] = []
+    if include_google_search:
+        tools.append(dict(GOOGLE_SEARCH_TOOL))
     if file_search_store_names:
         tools.append({
             "type": "file_search",
@@ -1234,23 +1239,29 @@ async def research_followup(
     query: str,
     *,
     model: str | None = None,
-) -> str:
+    include_interaction_id: bool = False,
+) -> str | tuple[str, str | None]:
     """
-    Ask a follow-up question about a completed Deep Research task.
+    Ask a follow-up question about a completed research interaction.
 
-    This continues the conversation context from a previous research task,
-    allowing clarification, summarization, or elaboration on specific sections
-    without restarting the entire research.
+    This continues the conversation context from a previous interaction created
+    by quick or Deep Research, allowing clarification, summarization, or
+    elaboration on specific sections without restarting the entire research.
+    Google Search is available again on the new interaction, because
+    interaction-scoped tools are not inherited.
 
     Args:
-        previous_interaction_id: Interaction ID from a completed research task
-                                 (available as result.interaction_id from research_deep)
+        previous_interaction_id: Interaction ID returned by research_web or
+                                 research_deep
         query: The follow-up question
         model: Model to use for the follow-up. Defaults to the configured
                GEMINI_MODEL / DEFAULT_MODEL (currently gemini-3.8-flash).
+        include_interaction_id: Return the next interaction ID alongside the
+            response text. Used by the MCP layer to keep a conversation chainable.
 
     Returns:
-        The text response to the follow-up question
+        The text response to the follow-up question, or its text and new
+        interaction ID when include_interaction_id is True
 
     Raises:
         DeepResearchError: On invalid interaction ID or API errors
@@ -1265,6 +1276,7 @@ async def research_followup(
             input=query,
             model=model,
             previous_interaction_id=previous_interaction_id,
+            tools=build_interactions_tools(include_google_search=True),
         )
         _record_client_success()
 
@@ -1279,6 +1291,9 @@ async def research_followup(
             )
 
         logger.info("   ✅ Follow-up response received")
+        if include_interaction_id:
+            interaction_id = _get_interaction_field(interaction, "id")
+            return text, interaction_id if isinstance(interaction_id, str) else None
         return text
 
     except Exception as e:

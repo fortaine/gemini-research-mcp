@@ -1,24 +1,18 @@
 """
 Quick research using Gemini grounded search.
 
-Provides fast web research with citations in 5-30 seconds.
+Provides fast, stateful web research with citations in 5-30 seconds.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING
+from typing import Any
 from urllib.parse import urlparse
 
 from google import genai
-from google.genai.types import (
-    GenerateContentConfig,
-    GoogleSearch,
-    ThinkingConfig,
-    ThinkingLevel,
-    Tool,
-)
+from google.genai.types import GenerateContentConfig, ThinkingConfig, ThinkingLevel
 from pydantic import BaseModel, Field
 
 from gemini_research_mcp.config import (
@@ -28,10 +22,13 @@ from gemini_research_mcp.config import (
     get_model,
     get_summary_model,
 )
+from gemini_research_mcp.deep import (
+    _as_sequence,
+    _extract_text_from_interaction,
+    _get_interaction_field,
+    build_interactions_tools,
+)
 from gemini_research_mcp.types import ResearchResult, Source
-
-if TYPE_CHECKING:
-    from google.genai.types import GenerateContentResponse
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -75,39 +72,47 @@ def _extract_sources_from_text(text: str) -> list[Source]:
     return sources
 
 
-def _extract_sources(response: GenerateContentResponse) -> tuple[list[Source], list[str]]:
-    """Extract sources and queries from grounding metadata.
-
-    Falls back to parsing URLs out of the response text whenever grounding
-    metadata is absent or empty - e.g. when the model answers from its own
-    knowledge without invoking the google_search tool at all.
-    """
+def _extract_sources_from_interaction(interaction: Any) -> tuple[list[Source], list[str]]:
+    """Extract Google Search citations and queries from an Interaction response."""
     sources: list[Source] = []
     queries: list[str] = []
+    seen_uris: set[str] = set()
 
-    candidate = response.candidates[0] if response.candidates else None
-    gm = candidate.grounding_metadata if candidate else None
-
-    if gm:
-        # Extract search queries used
-        if gm.web_search_queries:
-            queries = list(gm.web_search_queries)
-
-        # Extract sources from grounding chunks
-        if gm.grounding_chunks:
-            for chunk in gm.grounding_chunks:
-                if hasattr(chunk, "web") and chunk.web:
-                    sources.append(
-                        Source(
-                            uri=chunk.web.uri or "",
-                            title=chunk.web.title or "",
-                        )
-                    )
-
-    if not sources and response.text:
-        sources = _extract_sources_from_text(response.text)
+    for step in _as_sequence(_get_interaction_field(interaction, "steps")):
+        step_type = _get_interaction_field(step, "type")
+        if step_type == "google_search_call":
+            arguments = _get_interaction_field(step, "arguments")
+            for query in _as_sequence(_get_interaction_field(arguments, "queries")):
+                if isinstance(query, str):
+                    queries.append(query)
+        elif step_type == "model_output":
+            for content in _as_sequence(_get_interaction_field(step, "content")):
+                for annotation in _as_sequence(_get_interaction_field(content, "annotations")):
+                    if _get_interaction_field(annotation, "type") == "url_citation":
+                        uri = _get_interaction_field(annotation, "url")
+                        if isinstance(uri, str) and uri and uri not in seen_uris:
+                            seen_uris.add(uri)
+                            title = _get_interaction_field(annotation, "title")
+                            sources.append(
+                                Source(
+                                    uri=uri,
+                                    title=title if isinstance(title, str) else uri,
+                                )
+                            )
 
     return sources, queries
+
+
+def _extract_thinking_summary_from_interaction(interaction: Any) -> str | None:
+    """Return the available thought summary from an Interaction response."""
+    summaries: list[str] = []
+    for step in _as_sequence(_get_interaction_field(interaction, "steps")):
+        if _get_interaction_field(step, "type") == "thought":
+            for content in _as_sequence(_get_interaction_field(step, "summary")):
+                text = _get_interaction_field(content, "text")
+                if isinstance(text, str) and text.strip():
+                    summaries.append(text)
+    return "\n\n".join(summaries) or None
 
 
 async def quick_research(
@@ -119,7 +124,7 @@ async def quick_research(
     include_thoughts: bool = False,
 ) -> ResearchResult:
     """
-    Fast grounded search using google_search tool.
+    Fast grounded search using the Gemini Interactions API and google_search.
 
     Returns response grounded in real-time web search results.
     Typically completes in 5-30 seconds.
@@ -133,7 +138,8 @@ async def quick_research(
         include_thoughts: If True, include thinking summary in result
 
     Returns:
-        ResearchResult with text, sources, queries, and optional thinking summary
+        ResearchResult with text, sources, queries, interaction_id, and optional
+        thinking summary
     """
     client = genai.Client(api_key=get_api_key())
     model = model or get_model()
@@ -144,38 +150,33 @@ async def quick_research(
             thinking_level,
         )
 
-    config = GenerateContentConfig(
-        tools=[Tool(google_search=GoogleSearch())],
-        thinking_config=ThinkingConfig(
-            thinking_level=ThinkingLevel.HIGH,
-            include_thoughts=include_thoughts,
-        ),
+    generation_config: dict[str, str] = {"thinking_level": "high"}
+    if include_thoughts:
+        generation_config["thinking_summaries"] = "auto"
+
+    interaction = await client.aio.interactions.create(
+        model=model,
+        input=query,
+        tools=build_interactions_tools(include_google_search=True),
+        generation_config=generation_config,
         system_instruction=system_instruction or default_system_prompt(),
     )
 
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=query,
-        config=config,
+    text = _extract_text_from_interaction(interaction) or ""
+    sources, queries = _extract_sources_from_interaction(interaction)
+    if not sources and text:
+        sources = _extract_sources_from_text(text)
+    thinking_summary = (
+        _extract_thinking_summary_from_interaction(interaction) if include_thoughts else None
     )
-
-    sources, queries = _extract_sources(response)
-
-    # Extract thinking summary if present
-    thinking_summary = None
-    if include_thoughts and response.candidates:
-        content = response.candidates[0].content
-        if content is not None and content.parts is not None:
-            for part in content.parts:
-                if hasattr(part, "thought") and part.thought:
-                    thinking_summary = part.text
-                    break
+    interaction_id = _get_interaction_field(interaction, "id")
 
     return ResearchResult(
-        text=response.text or "",
+        text=text,
         sources=sources,
         queries=queries,
         thinking_summary=thinking_summary,
+        interaction_id=interaction_id if isinstance(interaction_id, str) else None,
     )
 
 

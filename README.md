@@ -32,7 +32,7 @@ flowchart TB
         subgraph Tools["Tools"]
             RW["research_web<br/>Quick lookup 5-30s"]
             RD["research_deep<br/>Autonomous 3-20min"]
-            RF["research_followup<br/>Continue session"]
+            RF["research_followup<br/>Continue interaction"]
             RR["resume_research<br/>Recover interrupted"]
             FW["fetch_webpage<br/>Content extraction"]
             EX["export_research_session<br/>MD/JSON/DOCX"]
@@ -64,7 +64,7 @@ flowchart TB
     
     RW --> Quick
     RD --> Deep
-    RF --> StorageMod
+    RF -->|"auto-match only"| StorageMod
     RR --> StorageMod
     FW --> Content
     LT --> Templates
@@ -92,14 +92,14 @@ by relevance through `search_tools`.
 
 | Tool | Description | Latency | Visible by default |
 |------|-------------|---------|---------------------|
-| `research_web` | Fast web search with citations | 5-30 sec | ✅ |
+| `research_web` | Fast web search with citations and a follow-up interaction ID | 5-30 sec | ✅ |
 | `research_deep` | Multi-step autonomous research (MCP Tasks) | 3-20 min | ✅ |
 | `research_deep_max` | Maximum-comprehensiveness Deep Research for exhaustive/high-stakes work | longer-running | ✅ |
 | `resume_research` | Resume interrupted/in-progress sessions | instant | ✅ |
 | `export_research_session` | Disk-first export to persistent Markdown, JSON, or DOCX artifacts | instant | ✅ |
 | `search_tools` | Discover hidden utility tools by relevance (BM25) | instant | ✅ |
 | `call_tool` | Proxy to invoke any hidden tool by name | varies | ✅ |
-| `research_followup` | Continue conversation after research | 5-30 sec | discoverable |
+| `research_followup` | Continue a `research_web` or Deep Research interaction, with fresh web search available | 5-30 sec | discoverable |
 | `list_research_sessions` | List saved research sessions | instant | discoverable |
 | `list_format_templates` | Browse report format templates | instant | discoverable |
 | `refine_research_plan` | Iterate on or approve a `collaborative_planning=True` plan | instant-3min | discoverable |
@@ -113,6 +113,27 @@ by relevance through `search_tools`.
 | `visualization` | `"off"` \| `"auto"` | `"off"` | Let the agent produce and persist supporting images/charts. Images are persisted as MCP resource artifacts (`research://exports/{id}`), never inlined as text. |
 | `collaborative_planning` | boolean | `false` | Return the drafted research plan and an interaction ID instead of running the full report. Approve or iterate on the plan with `refine_research_plan(previous_interaction_id=..., decision="approve"|"iterate")`. |
 | `mcp_servers` | array \| null | `null` | **Disabled.** Any non-empty value fails before network or Gemini API access because provider-side Deep Research remote MCP is not reliable. |
+
+### Follow-up research
+
+Both `research_web` and Deep Research return a Gemini interaction ID. Pass that
+ID to `research_followup` to keep Gemini's server-side conversation context;
+the follow-up also receives the Google Search tool again, so it can investigate
+new facts instead of being limited to the first response. Each follow-up returns
+the next interaction ID; use that ID for a further turn. This follows the
+[Gemini Interactions API continuation model](https://ai.google.dev/gemini-api/docs/interactions-overview),
+where context is linked by `previous_interaction_id` and interaction-scoped
+tools are declared again for each turn.
+
+```text
+research_web("What is the current Windows Server 2016 support for project X?")
+  -> Interaction ID: interaction-123
+
+research_followup(
+  interaction_id="interaction-123",
+  query="Search for recent issues that contradict this."
+)
+```
 
 ### `fetch_webpage` Parameters
 
